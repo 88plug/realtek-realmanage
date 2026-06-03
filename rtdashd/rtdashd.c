@@ -30,8 +30,8 @@ static _Atomic int metric_oob_messages_total = 0;
 static _Atomic long metric_last_push_timestamp = 0;
 static _Atomic int metric_hostname_syncs_total = 0;
 
-/* Server socket for metrics endpoint (global so main can close it on exit) */
-static int metrics_srv_fd = -1;
+/* Server socket for metrics endpoint — _Atomic so main/thread can access without races */
+static _Atomic int metrics_srv_fd = -1;
 
 /* Self-pipe for SIGHUP */
 static int sig_pipe[2] = { -1, -1 };
@@ -362,11 +362,14 @@ int main(int argc, char *argv[])
 
 	/* Metrics endpoint thread */
 	pthread_t mthr;
+	bool metrics_thread_started = false;
 	if (metrics_port > 0) {
 		if (pthread_create(&mthr, NULL, metrics_thread_func, &metrics_port) != 0)
 			syslog(LOG_WARNING, "failed to start metrics thread");
-		else
+		else {
+			metrics_thread_started = true;
 			syslog(LOG_INFO, "metrics thread started on port %d", metrics_port);
+		}
 	}
 
 	struct rtdash_ctx ctx;
@@ -513,10 +516,11 @@ int main(int argc, char *argv[])
 	rtdash_driver_exit(&ctx);
 	rtdash_close(&ctx);
 
-	if (metrics_port > 0 && metrics_srv_fd >= 0) {
-		/* Unblock the metrics thread's accept() by closing the server socket */
-		close(metrics_srv_fd);
-		metrics_srv_fd = -1;
+	if (metrics_thread_started) {
+		/* Close server socket to unblock accept() if thread is still running */
+		int srv = atomic_exchange(&metrics_srv_fd, -1);
+		if (srv >= 0)
+			close(srv);
 		pthread_join(mthr, NULL);
 	}
 
