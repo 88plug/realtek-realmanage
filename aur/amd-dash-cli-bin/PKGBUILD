@@ -1,0 +1,34 @@
+# Maintainer: Andrew <claude@null.pet>
+pkgname=amd-dash-cli-bin
+pkgver=8.0.0.346
+pkgrel=1
+pkgdesc='AMD DASH CLI — DMTF DASH management tool for Realtek/Broadcom DASH NICs'
+arch=('x86_64')
+url='https://www.amd.com/en/support/downloads/manageability-tools.html'
+license=('custom:AMD')
+depends=('glibc')
+provides=('dashcli')
+conflicts=('dashcli')
+source=("dashcli_${pkgver}_amd64.deb::https://www.amd.com/content/dam/amd/en/documents/manageability-tools/dashcli_${pkgver}_amd64.deb")
+sha256sums=('SKIP')
+# NOTE: Update sha256sums after downloading the actual .deb
+
+package() {
+    cd "$srcdir"
+
+    # Extract .deb
+    bsdtar -xf "dashcli_${pkgver}_amd64.deb"
+    bsdtar -xf data.tar.* -C "$pkgdir"
+
+    # Fix paths if needed (deb installs to /usr)
+    if [ -d "$pkgdir/usr/local" ]; then
+        cp -a "$pkgdir/usr/local/"* "$pkgdir/usr/" 2>/dev/null || true
+        rm -rf "$pkgdir/usr/local"
+    fi
+
+    install -dm755 "$pkgdir/usr/share/licenses/$pkgname"
+    if [ -f "$pkgdir/usr/share/doc/dashcli/copyright" ]; then
+        install -Dm644 "$pkgdir/usr/share/doc/dashcli/copyright" \
+            "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    fi
+}

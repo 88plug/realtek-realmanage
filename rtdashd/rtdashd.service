@@ -1,0 +1,17 @@
+[Unit]
+Description=Realtek RealManage DASH Client Daemon
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/sys/class/net
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/rtdashd
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=10
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

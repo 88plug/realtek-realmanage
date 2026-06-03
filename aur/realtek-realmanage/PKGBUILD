@@ -1,0 +1,27 @@
+# Maintainer: Andrew <claude@null.pet>
+pkgname=realtek-realmanage
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Linux toolkit for Realtek RealManage (DMTF DASH) out-of-band management'
+arch=('x86_64')
+url='https://github.com/88plug/realtek-realmanage'
+license=('custom:FSL-1.1-ALv2')
+depends=('glibc' 'wsmancli' 'curl' 'libxml2')
+optdepends=(
+    'tigervnc: KVM remote desktop'
+    'openssh: text console redirection and KVM tunnel'
+)
+makedepends=('gcc' 'make')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$pkgname-$pkgver"
+    make
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    make DESTDIR="$pkgdir" PREFIX=/usr install
+    install -Dm644 LICENSE.md "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

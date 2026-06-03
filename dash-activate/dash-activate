@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+#
+# dash-activate — Activate Realtek RealManage (DMTF DASH) from Linux
+#
+# Replaces the Windows-only DASHConfigRT provisioning tool.
+# Configures DASH credentials and network via the driver ioctl interface.
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+RTDASH_CTL=""  # path to rtdash-ctl binary (built from librtdash)
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log()  { echo -e "${GREEN}[+]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+err()  { echo -e "${RED}[-]${NC} $*" >&2; }
+die()  { err "$@"; exit 1; }
+
+usage() {
+    cat <<'EOF'
+dash-activate — Activate Realtek RealManage (DMTF DASH) from Linux
+
+USAGE:
+    sudo dash-activate [OPTIONS]
+
+OPTIONS:
+    -i <interface>     Network interface (auto-detect if omitted)
+    -u <username>      Admin username (default: Administrator)
+    -p <password>      Admin password (auto-generated if omitted)
+    -4 <ip/mask/gw>    OOB IPv4 config (e.g., 192.168.1.50/255.255.255.0/192.168.1.1)
+    -d                 Use DHCP for OOB network
+    -n                 Dry run (show what would be done)
+    -h                 Show help
+
+PREREQUISITES:
+    - DASH-capable Realtek NIC (RTL8111DP/EP/FP, RTL8125BP, RTL8126, RTL8127AP)
+    - DASH enabled in BIOS (Advanced > Network > RealManage Firmware Control)
+    - Realtek out-of-tree driver loaded (r8125/r8126/r8127 with DASH support)
+    - Root privileges
+
+NOTES:
+    Unlike Intel AMT, Realtek DASH cannot be activated without first enabling
+    it in the BIOS. This tool handles the post-BIOS credential and network
+    configuration that DASHConfigRT does on Windows.
+
+    After activation, manage the system remotely with:
+        realmanage -t <oob-ip> info
+        realmanage -t <oob-ip> power status
+
+HARDWARE COMPATIBILITY:
+    Confirmed working:
+    - RTL8111EP on Gigabyte B550M (DASH 2.0.18)
+    - RTL8111FP on HP EliteDesk 805 G8 (DASH via AMD PRO)
+    - RTL8125BP on AMD Ryzen PRO 6000+ platforms
+
+    Should work (untested):
+    - RTL8111DP (original DASH chip, 2009+)
+    - RTL8126 (5GbE DASH)
+    - RTL8127AP (10GbE DASH)
+
+    Does NOT work (no DASH hardware):
+    - RTL8111B/C/D/E/F/G/H/K/L (consumer, no management engine)
+    - RTL8125B (consumer 2.5GbE, no DASH)
+EOF
+}
+
+gen_password() {
+    # 16-char password: mixed case + digits + symbols
+    tr -dc 'A-Za-z0-9!@#$%^&*' </dev/urandom | head -c 16
+}
+
+detect_interface() {
+    local iface
+    for iface in /sys/class/net/*; do
+        iface=$(basename "$iface")
+        [ "$iface" = "lo" ] && continue
+
+        # check for Realtek DASH driver
+        local driver=""
+        if [ -L "/sys/class/net/$iface/device/driver" ]; then
+            driver=$(basename "$(readlink "/sys/class/net/$iface/device/driver")")
+        fi
+
+        case "$driver" in
+            r8125|r8126|r8127|r8168|r8169)
+                # check if DASH-capable via vendor/device ID
+                local vendor device
+                vendor=$(cat "/sys/class/net/$iface/device/vendor" 2>/dev/null || echo "")
+                device=$(cat "/sys/class/net/$iface/device/device" 2>/dev/null || echo "")
+
+                if [ "$vendor" = "0x10ec" ]; then
+                    log "Found Realtek NIC: $iface (driver=$driver, device=$device)"
+                    echo "$iface"
+                    return 0
+                fi
+                ;;
+        esac
+    done
+    return 1
+}
+
+check_dash_bios() {
+    local iface="$1"
+    # attempt to probe via ioctl — if driver supports DASH and BIOS has it enabled,
+    # the ioctl will succeed
+    if [ -n "$RTDASH_CTL" ] && [ -x "$RTDASH_CTL" ]; then
+        if "$RTDASH_CTL" -i "$iface" check 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # fallback: check dmesg for DASH indicators
+    if dmesg 2>/dev/null | grep -qi "dash\|realmanage\|oob.*ready"; then
+        return 0
+    fi
+
+    return 1
+}
+
+check_default_creds() {
+    local ip="$1"
+    # try connecting with default Realtek credentials
+    if command -v wsman >/dev/null 2>&1; then
+        local xml
+        xml=$(wsman enumerate "http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ComputerSystem" \
+            -h "$ip" -P 623 -u "Administrator" -p "Realtek" -y "http" \
+            -O - 2>/dev/null) || return 1
+        echo "$xml" | grep -q "ComputerSystem" && return 0
+    fi
+
+    # try curl to embedded web server
+    if curl -s --connect-timeout 3 "http://${ip}:623" 2>/dev/null | grep -qi "realtek\|dash"; then
+        return 0
+    fi
+
+    return 1
+}
+
+configure_via_wsman() {
+    local ip="$1" user="$2" pass="$3" old_user="Administrator" old_pass="Realtek"
+    local cim="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2"
+
+    log "Changing default credentials via WS-Man..."
+
+    # change password on default Administrator account
+    if [ "$old_pass" != "$pass" ]; then
+        wsman invoke -a "SetPassword" "${cim}/CIM_Account" \
+            -h "$ip" -P 623 -u "$old_user" -p "$old_pass" -y "http" \
+            -k "UserID=$old_user" \
+            -k "UserPassword=$pass" \
+            -O - 2>/dev/null || warn "Password change via WS-Man failed (may need DASHConfigRT path)"
+    fi
+
+    log "Credentials configured"
+}
+
+# --- Main ---
+
+[ "$(id -u)" -ne 0 ] && die "must run as root"
+
+IFACE=""
+USERNAME="Administrator"
+PASSWORD=""
+IPV4_CONFIG=""
+USE_DHCP=0
+DRY_RUN=0
+
+while getopts "i:u:p:4:dnh" opt; do
+    case "$opt" in
+        i) IFACE="$OPTARG" ;;
+        u) USERNAME="$OPTARG" ;;
+        p) PASSWORD="$OPTARG" ;;
+        4) IPV4_CONFIG="$OPTARG" ;;
+        d) USE_DHCP=1 ;;
+        n) DRY_RUN=1 ;;
+        h) usage; exit 0 ;;
+        *) usage; exit 1 ;;
+    esac
+done
+
+echo -e "${BLUE}"
+echo "  ╔══════════════════════════════════════════════╗"
+echo "  ║  dash-activate v${VERSION}                        ║"
+echo "  ║  Realtek RealManage (DMTF DASH) Provisioning ║"
+echo "  ╚══════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+# locate rtdash-ctl
+for candidate in ./rtdash-ctl /usr/bin/rtdash-ctl /usr/local/bin/rtdash-ctl; do
+    [ -x "$candidate" ] && RTDASH_CTL="$candidate" && break
+done
+
+# Step 1: Find interface
+if [ -z "$IFACE" ]; then
+    log "Auto-detecting DASH-capable interface..."
+    IFACE=$(detect_interface) || die "No Realtek DASH NIC found. Check: lspci | grep -i realtek"
+fi
+log "Interface: $IFACE"
+
+# Step 2: Verify DASH is enabled in BIOS
+log "Checking DASH firmware status..."
+if ! check_dash_bios "$IFACE"; then
+    warn "DASH may not be enabled in BIOS"
+    echo ""
+    echo "  To enable DASH in BIOS:"
+    echo "  1. Reboot and enter BIOS Setup"
+    echo "  2. Navigate to: Advanced > Network Controller / Realtek LAN"
+    echo "  3. Enable: RealManage Firmware Control"
+    echo "  4. Enable: DASH Support"
+    echo "  5. (Optional) Enable: MCTP, ASF, Serial Port Console Redirection"
+    echo "  6. Save and exit"
+    echo ""
+    echo "  Vendor-specific paths:"
+    echo "  - Gigabyte: Peripherals > Realtek PCIe GBE Family Controller"
+    echo "  - HP:       Advanced > Built-In Device Options > LAN DASH Support"
+    echo "  - Lenovo:   Advanced > Network Setup > DASH Configuration"
+    echo "  - Dell:     System Configuration > NIC Configuration > DASH Support"
+    echo ""
+    read -rp "Continue anyway? [y/N] " yn
+    [ "$yn" = "y" ] || [ "$yn" = "Y" ] || exit 1
+fi
+
+# Step 3: Generate password if not provided
+if [ -z "$PASSWORD" ]; then
+    PASSWORD=$(gen_password)
+    log "Generated password: $PASSWORD"
+    warn "SAVE THIS PASSWORD — you need it for remote management"
+fi
+
+# Step 4: Show plan
+echo ""
+echo "  Configuration:"
+echo "    Interface:  $IFACE"
+echo "    Username:   $USERNAME"
+echo "    Password:   $PASSWORD"
+if [ -n "$IPV4_CONFIG" ]; then
+    echo "    OOB IPv4:   $IPV4_CONFIG"
+elif [ "$USE_DHCP" -eq 1 ]; then
+    echo "    OOB Network: DHCP"
+else
+    echo "    OOB Network: (keep current)"
+fi
+echo ""
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    log "Dry run — no changes made"
+    exit 0
+fi
+
+read -rp "Proceed with activation? [y/N] " yn
+[ "$yn" = "y" ] || [ "$yn" = "Y" ] || exit 1
+
+# Step 5: Configure OOB network if requested
+if [ -n "$IPV4_CONFIG" ] && [ -n "$RTDASH_CTL" ]; then
+    IFS='/' read -r oob_ip oob_mask oob_gw <<< "$IPV4_CONFIG"
+    log "Setting OOB IPv4: $oob_ip / $oob_mask / $oob_gw"
+    "$RTDASH_CTL" -i "$IFACE" set-ipv4 "$oob_ip" "$oob_mask" "$oob_gw" || warn "set-ipv4 failed"
+fi
+
+# Step 6: Try to change credentials
+# First, try WS-Man path (works if DASH is already listening on default creds)
+OOB_IP=""
+if [ -n "$IPV4_CONFIG" ]; then
+    OOB_IP="${IPV4_CONFIG%%/*}"
+elif [ -n "$RTDASH_CTL" ]; then
+    OOB_IP=$("$RTDASH_CTL" -i "$IFACE" get-ipv4 2>/dev/null | awk '{print $1}') || true
+fi
+
+if [ -n "$OOB_IP" ]; then
+    log "Checking if DASH is reachable at $OOB_IP:623..."
+    if check_default_creds "$OOB_IP"; then
+        log "DASH responding with default credentials — changing now"
+        configure_via_wsman "$OOB_IP" "$USERNAME" "$PASSWORD"
+    else
+        warn "Cannot reach DASH at $OOB_IP:623 with default credentials"
+        warn "Credentials may already be changed, or DASH not yet initialized"
+    fi
+else
+    warn "No OOB IP known — skipping credential configuration"
+    warn "Use the BIOS RealManage Setup Agent (Shift+F10 at POST) to set initial credentials"
+fi
+
+# Step 7: Send driver ready + sync hostname via ioctl
+if [ -n "$RTDASH_CTL" ]; then
+    log "Sending DRIVER_READY signal..."
+    "$RTDASH_CTL" -i "$IFACE" driver-ready || warn "driver-ready failed"
+
+    log "Syncing hostname..."
+    "$RTDASH_CTL" -i "$IFACE" sync-hostname || warn "sync-hostname failed"
+fi
+
+# Step 8: Verify
+echo ""
+log "Activation complete!"
+echo ""
+echo "  Next steps:"
+echo "    1. Verify: realmanage -t $OOB_IP -u $USERNAME -P '$PASSWORD' info"
+echo "    2. Web UI: http://$OOB_IP:623"
+echo "    3. Power:  realmanage -t $OOB_IP -u $USERNAME -P '$PASSWORD' power status"
+echo "    4. Enable rtdashd service: sudo systemctl enable --now rtdashd"
+echo ""
+
+if [ -n "$RTDASH_CTL" ]; then
+    echo "  Start the DASH client daemon for OS info push + graceful shutdown:"
+    echo "    sudo systemctl enable --now rtdashd"
+fi

@@ -1,0 +1,53 @@
+name: Auto-update AMD DASH CLI AUR package
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # daily at 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check-update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for new AMD DASH CLI version
+        id: check
+        run: |
+          CURRENT=$(grep 'pkgver=' aur/amd-dash-cli-bin/PKGBUILD | cut -d= -f2)
+          echo "current=$CURRENT"
+
+          # Check AMD download page for newer version
+          PAGE=$(curl -sL 'https://www.amd.com/en/support/downloads/manageability-tools.html')
+          LATEST=$(echo "$PAGE" | grep -oP 'dashcli_\K[0-9.]+(?=_amd64\.deb)' | sort -V | tail -1)
+
+          if [ -z "$LATEST" ]; then
+            echo "Could not determine latest version"
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "latest=$LATEST"
+
+          if [ "$CURRENT" != "$LATEST" ]; then
+            echo "update=true" >> "$GITHUB_OUTPUT"
+            echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          else
+            echo "update=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update PKGBUILD
+        if: steps.check.outputs.update == 'true'
+        run: |
+          VERSION=${{ steps.check.outputs.version }}
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur/amd-dash-cli-bin/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" aur/amd-dash-cli-bin/PKGBUILD
+
+      - name: Create PR
+        if: steps.check.outputs.update == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          title: "aur: bump amd-dash-cli-bin to ${{ steps.check.outputs.version }}"
+          body: "Auto-detected new AMD DASH CLI release: ${{ steps.check.outputs.version }}"
+          branch: "auto/amd-dash-cli-${{ steps.check.outputs.version }}"
+          commit-message: "aur: bump amd-dash-cli-bin to ${{ steps.check.outputs.version }}"

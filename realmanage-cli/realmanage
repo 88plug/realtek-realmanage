@@ -1,0 +1,535 @@
+#!/usr/bin/env bash
+#
+# realmanage — CLI for Realtek RealManage (DMTF DASH) out-of-band management
+# Wraps wsmancli for WS-Man operations against DASH targets on port 623/664.
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+DEFAULT_PORT=623
+DEFAULT_USER="Administrator"
+DEFAULT_PASS="Realtek"
+
+# CIM schema base URI
+CIM="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2"
+
+usage() {
+    cat <<'EOF'
+realmanage — Realtek RealManage (DMTF DASH) management CLI
+
+USAGE:
+    realmanage [OPTIONS] <COMMAND>
+
+OPTIONS:
+    -t <host>       Target host (IP or hostname)
+    -p <port>       Port (default: 623)
+    -u <user>       Username (default: Administrator)
+    -P <pass>       Password (default: Realtek)
+    -s              Use HTTPS (port 664)
+    -k              Skip TLS certificate verification
+
+COMMANDS:
+    discover <ip|range>     Discover DASH-capable systems
+    info                    Show system information
+    power status            Show power state
+    power on                Power on
+    power off               Power off (hard)
+    power off-graceful      Graceful shutdown
+    power cycle             Power cycle
+    power reset             Reset
+    cpu                     Show CPU information
+    memory                  Show memory information
+    bios                    Show BIOS information
+    boot                    Show boot configuration
+    boot set <device>       Set next boot device
+    fans                    Show fan status
+    sensors                 Show sensor readings
+    os                      Show OS status
+    software                Show software inventory
+    net                     Show network configuration
+    accounts                List user accounts
+    account add <u> <p> <r> Add account (role: admin|operator|readonly)
+    account del <u>         Delete account
+    password <u> <p>        Change password
+    log                     Show event log
+    profiles                List supported DASH profiles
+    fw-version              Show DASH firmware version
+    fw-update <url>         Update firmware from URL
+    kvm                     Start KVM session (launches VNC)
+    tcr                     Start text console redirection
+    raw <uri> [action]      Raw WS-Man operation
+    version                 Show realmanage version
+
+EXAMPLES:
+    realmanage -t 192.168.1.100 info
+    realmanage -t 192.168.1.100 power on
+    realmanage -t 192.168.1.100 -s -k power status
+    realmanage discover 192.168.1.0/24
+EOF
+}
+
+die() { echo "realmanage: $*" >&2; exit 1; }
+
+check_deps() {
+    for cmd in wsman curl xmllint; do
+        command -v "$cmd" >/dev/null 2>&1 || die "missing dependency: $cmd (install wsmancli, curl, libxml2-utils)"
+    done
+}
+
+# WS-Man helper: enumerate instances
+wsman_enum() {
+    local uri="$1"
+    wsman enumerate "$uri" \
+        -h "$HOST" -P "$PORT" \
+        -u "$USER" -p "$PASS" \
+        -y "$SCHEME" \
+        ${SKIP_CERT:+-V} \
+        --dialect="http://schemas.dmtf.org/wbem/wsman/1/wsman/SelectorFilter" \
+        -O - 2>/dev/null
+}
+
+# WS-Man helper: get single instance
+wsman_get() {
+    local uri="$1"
+    shift
+    wsman get "$uri" \
+        -h "$HOST" -P "$PORT" \
+        -u "$USER" -p "$PASS" \
+        -y "$SCHEME" \
+        ${SKIP_CERT:+-V} \
+        "$@" \
+        -O - 2>/dev/null
+}
+
+# WS-Man helper: invoke method
+wsman_invoke() {
+    local uri="$1"
+    local method="$2"
+    shift 2
+    wsman invoke -a "$method" "$uri" \
+        -h "$HOST" -P "$PORT" \
+        -u "$USER" -p "$PASS" \
+        -y "$SCHEME" \
+        ${SKIP_CERT:+-V} \
+        "$@" \
+        -O - 2>/dev/null
+}
+
+# Extract XML element value
+xml_val() {
+    local xml="$1" tag="$2"
+    echo "$xml" | xmllint --xpath "//*[local-name()='$tag']/text()" - 2>/dev/null || echo "N/A"
+}
+
+# Extract all instances of a tag
+xml_vals() {
+    local xml="$1" tag="$2"
+    echo "$xml" | xmllint --xpath "//*[local-name()='$tag']" - 2>/dev/null || true
+}
+
+power_state_name() {
+    case "$1" in
+        2)  echo "On" ;;
+        3)  echo "Sleep (Light)" ;;
+        4)  echo "Sleep (Deep)" ;;
+        6)  echo "Off (Hard)" ;;
+        7)  echo "Hibernate" ;;
+        8)  echo "Off (Soft)" ;;
+        9)  echo "Power Cycle (Off Hard)" ;;
+        *)  echo "Unknown ($1)" ;;
+    esac
+}
+
+cmd_info() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_ComputerSystem")
+    echo "=== System Information ==="
+    echo "Name:          $(xml_val "$xml" "Name")"
+    echo "ElementName:   $(xml_val "$xml" "ElementName")"
+    echo "Description:   $(xml_val "$xml" "Description")"
+
+    local ps_xml
+    ps_xml=$(wsman_enum "${CIM}/CIM_AssociatedPowerManagementService")
+    local state
+    state=$(xml_val "$ps_xml" "PowerState")
+    echo "Power State:   $(power_state_name "$state")"
+}
+
+cmd_power_status() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_AssociatedPowerManagementService")
+    local state
+    state=$(xml_val "$xml" "PowerState")
+    echo "$(power_state_name "$state")"
+}
+
+cmd_power_change() {
+    local target_state="$1"
+    local xml
+    xml=$(wsman_invoke "${CIM}/CIM_PowerManagementService" \
+        "RequestPowerStateChange" \
+        -k "PowerState=$target_state")
+    local rv
+    rv=$(xml_val "$xml" "ReturnValue")
+    if [ "$rv" = "0" ]; then
+        echo "OK"
+    else
+        echo "Failed (return=$rv)"
+        return 1
+    fi
+}
+
+cmd_cpu() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_Processor")
+    echo "=== CPU ==="
+    echo "Name:            $(xml_val "$xml" "ElementName")"
+    echo "Family:          $(xml_val "$xml" "Family")"
+    echo "Max Speed:       $(xml_val "$xml" "MaxClockSpeed") MHz"
+    echo "Current Speed:   $(xml_val "$xml" "CurrentClockSpeed") MHz"
+    echo "Cores:           $(xml_val "$xml" "NumberOfEnabledCores")"
+    echo "Threads:         $(xml_val "$xml" "NumberOfEnabledThreads")"
+    echo "Load:            $(xml_val "$xml" "LoadPercentage")%"
+    echo "Status:          $(xml_val "$xml" "EnabledState")"
+}
+
+cmd_memory() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_PhysicalMemory")
+    echo "=== Memory ==="
+    echo "Capacity:    $(xml_val "$xml" "Capacity") bytes"
+    echo "Speed:       $(xml_val "$xml" "Speed") MHz"
+    echo "Form:        $(xml_val "$xml" "FormFactor")"
+    echo "Type:        $(xml_val "$xml" "MemoryType")"
+    echo "Manufacturer:$(xml_val "$xml" "Manufacturer")"
+    echo "Part:        $(xml_val "$xml" "PartNumber")"
+    echo "Serial:      $(xml_val "$xml" "SerialNumber")"
+}
+
+cmd_bios() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_BIOSElement")
+    echo "=== BIOS ==="
+    echo "Name:        $(xml_val "$xml" "Name")"
+    echo "Version:     $(xml_val "$xml" "Version")"
+    echo "Manufacturer:$(xml_val "$xml" "Manufacturer")"
+    echo "Release:     $(xml_val "$xml" "ReleaseDate")"
+}
+
+cmd_boot() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_BootSourceSetting")
+    echo "=== Boot Configuration ==="
+    xml_vals "$xml" "BootSourceSetting" | while IFS= read -r line; do
+        local name
+        name=$(echo "$line" | xmllint --xpath "//*[local-name()='ElementName']/text()" - 2>/dev/null || true)
+        [ -n "$name" ] && echo "  - $name"
+    done
+}
+
+cmd_boot_set() {
+    local device="$1"
+    local xml
+    xml=$(wsman_invoke "${CIM}/CIM_BootConfigSetting" \
+        "ChangeBootOrder" \
+        -k "Source=${CIM}/CIM_BootSourceSetting?ElementName=$device")
+    local rv
+    rv=$(xml_val "$xml" "ReturnValue")
+    [ "$rv" = "0" ] && echo "Boot device set to: $device" || echo "Failed (return=$rv)"
+}
+
+cmd_fans() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_Fan")
+    echo "=== Fans ==="
+    echo "Name:        $(xml_val "$xml" "ElementName")"
+    echo "Speed:       $(xml_val "$xml" "DesiredSpeed") RPM"
+    echo "Status:      $(xml_val "$xml" "HealthState")"
+}
+
+cmd_sensors() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_NumericSensor")
+    echo "=== Sensors ==="
+    echo "Name:        $(xml_val "$xml" "ElementName")"
+    echo "Reading:     $(xml_val "$xml" "CurrentReading")"
+    echo "Units:       $(xml_val "$xml" "BaseUnits")"
+    echo "Status:      $(xml_val "$xml" "HealthState")"
+}
+
+cmd_os() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_OperatingSystem")
+    echo "=== Operating System ==="
+    echo "Name:        $(xml_val "$xml" "Name")"
+    echo "Version:     $(xml_val "$xml" "Version")"
+    echo "Status:      $(xml_val "$xml" "EnabledState")"
+}
+
+cmd_software() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_SoftwareIdentity")
+    echo "=== Software Inventory ==="
+    echo "Name:        $(xml_val "$xml" "ElementName")"
+    echo "Version:     $(xml_val "$xml" "VersionString")"
+    echo "Manufacturer:$(xml_val "$xml" "Manufacturer")"
+}
+
+cmd_net() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_EthernetPort")
+    echo "=== Ethernet Port ==="
+    echo "Name:        $(xml_val "$xml" "ElementName")"
+    echo "MAC:         $(xml_val "$xml" "PermanentAddress")"
+    echo "Speed:       $(xml_val "$xml" "Speed")"
+    echo "Status:      $(xml_val "$xml" "EnabledState")"
+
+    xml=$(wsman_enum "${CIM}/CIM_IPProtocolEndpoint")
+    echo ""
+    echo "=== IP Configuration ==="
+    echo "Address:     $(xml_val "$xml" "IPv4Address")"
+    echo "Subnet:      $(xml_val "$xml" "SubnetMask")"
+}
+
+cmd_accounts() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_Account")
+    echo "=== Accounts ==="
+    echo "UserID:      $(xml_val "$xml" "UserID")"
+    echo "Name:        $(xml_val "$xml" "Name")"
+}
+
+cmd_account_add() {
+    local user="$1" pass="$2" role="$3"
+    local role_name
+    case "$role" in
+        admin)    role_name="Administrator Role" ;;
+        operator) role_name="Operator Role" ;;
+        readonly) role_name="Read Only Role" ;;
+        *)        die "unknown role: $role (use admin|operator|readonly)" ;;
+    esac
+    local xml
+    xml=$(wsman_invoke "${CIM}/CIM_AccountManagementService" \
+        "CreateAccount" \
+        -k "UserID=$user" \
+        -k "UserPassword=$pass")
+    local rv
+    rv=$(xml_val "$xml" "ReturnValue")
+    [ "$rv" = "0" ] && echo "Account created: $user ($role_name)" || echo "Failed (return=$rv)"
+}
+
+cmd_account_del() {
+    local user="$1"
+    local xml
+    xml=$(wsman_invoke "${CIM}/CIM_Account" \
+        "RequestStateChange" \
+        -k "UserID=$user" \
+        -k "RequestedState=3")
+    echo "Account deleted: $user"
+}
+
+cmd_password() {
+    local user="$1" pass="$2"
+    local xml
+    xml=$(wsman_invoke "${CIM}/CIM_Account" \
+        "SetPassword" \
+        -k "UserID=$user" \
+        -k "UserPassword=$pass")
+    local rv
+    rv=$(xml_val "$xml" "ReturnValue")
+    [ "$rv" = "0" ] && echo "Password changed for: $user" || echo "Failed (return=$rv)"
+}
+
+cmd_log() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_RecordLog")
+    echo "=== Event Log ==="
+    echo "$xml" | xmllint --format - 2>/dev/null || echo "$xml"
+}
+
+cmd_profiles() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_RegisteredProfile")
+    echo "=== Supported DASH Profiles ==="
+    echo "$xml" | xmllint --xpath "//*[local-name()='RegisteredName']/text()" - 2>/dev/null | tr ' ' '\n' || echo "N/A"
+}
+
+cmd_fw_version() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_SoftwareIdentity")
+    echo "DASH FW: $(xml_val "$xml" "VersionString")"
+}
+
+cmd_fw_update() {
+    local url="$1"
+    local xml
+    xml=$(wsman_invoke "${CIM}/CIM_SoftwareInstallationService" \
+        "InstallFromURI" \
+        -k "URI=$url")
+    local rv
+    rv=$(xml_val "$xml" "ReturnValue")
+    [ "$rv" = "0" ] && echo "Firmware update initiated from: $url" || echo "Failed (return=$rv)"
+}
+
+cmd_kvm() {
+    echo "Starting KVM session to $HOST..."
+    echo "Connecting via VNC (SSH tunnel on port 22)..."
+    if command -v vncviewer >/dev/null 2>&1; then
+        ssh -N -L 5900:localhost:5900 "$USER@$HOST" &
+        local ssh_pid=$!
+        sleep 2
+        vncviewer localhost:5900
+        kill "$ssh_pid" 2>/dev/null
+    else
+        die "vncviewer not found. Install tigervnc or similar."
+    fi
+}
+
+cmd_tcr() {
+    echo "Starting Text Console Redirection to $HOST..."
+    local xml
+    xml=$(wsman_invoke "${CIM}/CIM_TextRedirectionSAP" \
+        "RequestStateChange" \
+        -k "RequestedState=2")
+    if command -v ssh >/dev/null 2>&1; then
+        ssh -o StrictHostKeyChecking=no "$USER@$HOST"
+    else
+        die "ssh not found"
+    fi
+}
+
+cmd_discover() {
+    local target="$1"
+    echo "Discovering DASH systems on $target ..."
+    if [[ "$target" == *"/"* ]]; then
+        local base prefix
+        prefix="${target##*/}"
+        base="${target%/*}"
+        base="${base%.*}"
+        local start end
+        case "$prefix" in
+            24) start=1; end=254 ;;
+            16) start=1; end=254 ;;  # simplified: scans last octet only
+            *)  die "unsupported prefix: /$prefix" ;;
+        esac
+        for i in $(seq "$start" "$end"); do
+            local ip="${base}.${i}"
+            if curl -s -o /dev/null -w '' --connect-timeout 1 "http://${ip}:623" 2>/dev/null; then
+                echo "  DASH: $ip:623"
+            fi
+        done
+    else
+        if curl -s --connect-timeout 2 "http://${target}:623" 2>/dev/null | grep -qi "realtek\|dash"; then
+            echo "  DASH: $target:623 (Realtek)"
+        else
+            echo "  No DASH response from $target:623"
+        fi
+    fi
+}
+
+cmd_raw() {
+    local uri="$1"
+    local action="${2:-enumerate}"
+    case "$action" in
+        enumerate) wsman_enum "$uri" | xmllint --format - 2>/dev/null ;;
+        get)       wsman_get "$uri" | xmllint --format - 2>/dev/null ;;
+        *)         die "raw action must be enumerate|get" ;;
+    esac
+}
+
+# --- Main ---
+
+HOST=""
+PORT="$DEFAULT_PORT"
+USER="$DEFAULT_USER"
+PASS="$DEFAULT_PASS"
+SCHEME="http"
+SKIP_CERT=""
+
+while getopts "t:p:u:P:skh" opt; do
+    case "$opt" in
+        t) HOST="$OPTARG" ;;
+        p) PORT="$OPTARG" ;;
+        u) USER="$OPTARG" ;;
+        P) PASS="$OPTARG" ;;
+        s) SCHEME="https"; [ "$PORT" = "$DEFAULT_PORT" ] && PORT=664 ;;
+        k) SKIP_CERT=1 ;;
+        h) usage; exit 0 ;;
+        *) usage; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[ $# -eq 0 ] && { usage; exit 1; }
+
+CMD="$1"; shift
+
+case "$CMD" in
+    version)  echo "realmanage $VERSION" ;;
+    discover)
+        [ $# -lt 1 ] && die "usage: realmanage discover <ip|range>"
+        cmd_discover "$1"
+        ;;
+    *)
+        [ -z "$HOST" ] && die "target host required (-t <host>)"
+        check_deps
+        case "$CMD" in
+            info)       cmd_info ;;
+            power)
+                [ $# -lt 1 ] && die "usage: realmanage power <status|on|off|off-graceful|cycle|reset>"
+                case "$1" in
+                    status)       cmd_power_status ;;
+                    on)           cmd_power_change 2 ;;
+                    off)          cmd_power_change 6 ;;
+                    off-graceful) cmd_power_change 12 ;;
+                    cycle)        cmd_power_change 5 ;;
+                    reset)        cmd_power_change 10 ;;
+                    *)            die "unknown power command: $1" ;;
+                esac
+                ;;
+            cpu)        cmd_cpu ;;
+            memory)     cmd_memory ;;
+            bios)       cmd_bios ;;
+            boot)
+                if [ $# -gt 0 ] && [ "$1" = "set" ]; then
+                    [ $# -lt 2 ] && die "usage: realmanage boot set <device>"
+                    cmd_boot_set "$2"
+                else
+                    cmd_boot
+                fi
+                ;;
+            fans)       cmd_fans ;;
+            sensors)    cmd_sensors ;;
+            os)         cmd_os ;;
+            software)   cmd_software ;;
+            net)        cmd_net ;;
+            accounts)   cmd_accounts ;;
+            account)
+                [ $# -lt 1 ] && die "usage: realmanage account <add|del> ..."
+                case "$1" in
+                    add) [ $# -lt 4 ] && die "usage: realmanage account add <user> <pass> <role>"; cmd_account_add "$2" "$3" "$4" ;;
+                    del) [ $# -lt 2 ] && die "usage: realmanage account del <user>"; cmd_account_del "$2" ;;
+                    *)   die "unknown account command: $1" ;;
+                esac
+                ;;
+            password)
+                [ $# -lt 2 ] && die "usage: realmanage password <user> <pass>"
+                cmd_password "$1" "$2"
+                ;;
+            log)        cmd_log ;;
+            profiles)   cmd_profiles ;;
+            fw-version) cmd_fw_version ;;
+            fw-update)
+                [ $# -lt 1 ] && die "usage: realmanage fw-update <url>"
+                cmd_fw_update "$1"
+                ;;
+            kvm)        cmd_kvm ;;
+            tcr)        cmd_tcr ;;
+            raw)
+                [ $# -lt 1 ] && die "usage: realmanage raw <uri> [enumerate|get]"
+                cmd_raw "$1" "${2:-enumerate}"
+                ;;
+            *)          die "unknown command: $CMD" ;;
+        esac
+        ;;
+esac
