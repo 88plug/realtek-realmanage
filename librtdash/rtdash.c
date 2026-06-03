@@ -55,6 +55,9 @@ static int rtdash_dash_cmd_simple(struct rtdash_ctx *ctx, uint32_t cmd)
 
 int rtdash_open(struct rtdash_ctx *ctx, const char *ifname)
 {
+	if (!ifname || strlen(ifname) >= sizeof(ctx->ifname))
+		return -EINVAL;
+
 	memset(ctx, 0, sizeof(*ctx));
 	strncpy(ctx->ifname, ifname, sizeof(ctx->ifname) - 1);
 

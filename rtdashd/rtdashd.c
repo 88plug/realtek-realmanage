@@ -17,16 +17,21 @@
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
+#include <stdatomic.h>
+#include <dirent.h>
 
 #include "../librtdash/rtdash.h"
 
 static volatile int running = 1;
 
-/* Prometheus metrics (updated atomically from main thread) */
-static volatile int metric_driver_ready_total = 0;
-static volatile int metric_oob_messages_total = 0;
-static volatile long metric_last_push_timestamp = 0;
-static volatile int metric_hostname_syncs_total = 0;
+/* Prometheus metrics — atomic for safe cross-thread access */
+static _Atomic int metric_driver_ready_total = 0;
+static _Atomic int metric_oob_messages_total = 0;
+static _Atomic long metric_last_push_timestamp = 0;
+static _Atomic int metric_hostname_syncs_total = 0;
+
+/* Server socket for metrics endpoint (global so main can close it on exit) */
+static int metrics_srv_fd = -1;
 
 /* Self-pipe for SIGHUP */
 static int sig_pipe[2] = { -1, -1 };
@@ -172,6 +177,7 @@ static void *metrics_thread_func(void *arg)
 		syslog(LOG_ERR, "metrics: socket: %m");
 		return NULL;
 	}
+	metrics_srv_fd = srv;
 
 	setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 
@@ -252,27 +258,27 @@ static void usage(const char *prog)
 
 static int find_dash_interface(char *ifname, size_t len)
 {
-	FILE *fp;
-	char line[256];
+	DIR *d;
+	struct dirent *ent;
 
-	fp = popen("ls /sys/class/net/ 2>/dev/null", "r");
-	if (!fp)
+	d = opendir("/sys/class/net");
+	if (!d)
 		return -1;
 
 	struct rtdash_ctx probe;
-	while (fgets(line, sizeof(line), fp)) {
-		line[strcspn(line, "\n")] = '\0';
-		if (strlen(line) == 0)
+	while ((ent = readdir(d)) != NULL) {
+		if (ent->d_name[0] == '.')
 			continue;
 
-		if (rtdash_open(&probe, line) == 0) {
+		if (rtdash_open(&probe, ent->d_name) == 0) {
 			if (rtdash_enable_diag(&probe) == 0) {
 				bool capable = rtdash_is_dash_capable(&probe);
 				rtdash_disable_diag(&probe);
 				if (capable) {
-					snprintf(ifname, len, "%.*s", (int)(len - 1), line);
+					snprintf(ifname, len, "%.*s",
+					         (int)(len - 1), ent->d_name);
 					rtdash_close(&probe);
-					pclose(fp);
+					closedir(d);
 					return 0;
 				}
 			}
@@ -280,7 +286,7 @@ static int find_dash_interface(char *ifname, size_t len)
 		}
 	}
 
-	pclose(fp);
+	closedir(d);
 	return -1;
 }
 
@@ -303,8 +309,7 @@ int main(int argc, char *argv[])
 	while ((opt = getopt(argc, argv, "i:fm:I:h")) != -1) {
 		switch (opt) {
 		case 'i':
-			strncpy(ifname, optarg, sizeof(ifname) - 1);
-			ifname[sizeof(ifname) - 1] = '\0';
+			snprintf(ifname, sizeof(ifname), "%s", optarg);
 			break;
 		case 'f':
 			foreground = 1;
@@ -505,6 +510,14 @@ int main(int argc, char *argv[])
 	syslog(LOG_INFO, "shutting down, sending DRIVER_EXIT");
 	rtdash_driver_exit(&ctx);
 	rtdash_close(&ctx);
+
+	if (metrics_port > 0 && metrics_srv_fd >= 0) {
+		/* Unblock the metrics thread's accept() by closing the server socket */
+		close(metrics_srv_fd);
+		metrics_srv_fd = -1;
+		pthread_join(mthr, NULL);
+	}
+
 	closelog();
 	return 0;
 }
