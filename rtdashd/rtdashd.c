@@ -188,12 +188,14 @@ static void *metrics_thread_func(void *arg)
 
 	if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		syslog(LOG_ERR, "metrics: bind port %d: %m", port);
+		metrics_srv_fd = -1;
 		close(srv);
 		return NULL;
 	}
 
 	if (listen(srv, 8) < 0) {
 		syslog(LOG_ERR, "metrics: listen: %m");
+		metrics_srv_fd = -1;
 		close(srv);
 		return NULL;
 	}
@@ -242,7 +244,7 @@ static void *metrics_thread_func(void *arg)
 		close(client);
 	}
 
-	close(srv);
+	/* srv is closed by main thread after pthread_join — do not close here */
 	return NULL;
 }
 
