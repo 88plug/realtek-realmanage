@@ -1,6 +1,9 @@
+#define _GNU_SOURCE
+
 #include "rtdash.h"
 #include "rtdash_ioctl.h"
 
+#include <endian.h>
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
@@ -93,7 +96,29 @@ int rtdash_disable_diag(struct rtdash_ctx *ctx)
 
 bool rtdash_is_dash_capable(struct rtdash_ctx *ctx)
 {
-	return rtdash_dash_cmd_simple(ctx, RTL_DASH_OOB_REQ) == 0;
+	uint8_t buf[4] = {0};
+	int ret = rtdash_dash_cmd(ctx, RTL_DASH_CHECK_SEND_BUFFER_TO_DASH_FW_COMPLETE,
+	                          0, sizeof(buf), buf);
+	return ret != -EOPNOTSUPP;
+}
+
+uint32_t rtdash_get_fw_version(struct rtdash_ctx *ctx)
+{
+	struct rtltool_cmd_struct tool = {
+		.cmd    = RTL_READ_OCP,
+		.offset = 0x120,
+		.len    = 4,
+		.data   = 0,
+	};
+	struct ifreq ifr;
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ctx->ifname, IFNAMSIZ - 1);
+	ifr.ifr_data = (void *)&tool;
+
+	if (ioctl(ctx->sock, SIOCRTLTOOL, &ifr) < 0)
+		return 0;
+	return tool.data;
 }
 
 int rtdash_arm_req(struct rtdash_ctx *ctx)
@@ -252,6 +277,62 @@ int rtdash_get_ipv4(struct rtdash_ctx *ctx, uint32_t *addr, uint32_t *mask, uint
 		*gw   = buf[2];
 	}
 	return ret;
+}
+
+int rtdash_set_ipv6(struct rtdash_ctx *ctx, const uint8_t addr[16], uint8_t prefix, const uint8_t gw[16])
+{
+	uint8_t buf[33];
+	memcpy(buf, addr, 16);
+	buf[16] = prefix;
+	memcpy(buf + 17, gw, 16);
+	return rtdash_dash_cmd(ctx, RTL_FW_SET_IPV6, 0, 33, buf);
+}
+
+int rtdash_get_ipv6(struct rtdash_ctx *ctx, uint8_t addr[16], uint8_t *prefix, uint8_t gw[16])
+{
+	uint8_t buf[33] = {0};
+	int ret = rtdash_dash_cmd(ctx, RTL_FW_GET_IPV6, 0, 33, buf);
+	if (ret == 0) {
+		memcpy(addr, buf, 16);
+		*prefix = buf[16];
+		memcpy(gw, buf + 17, 16);
+	}
+	return ret;
+}
+
+int rtdash_set_snmp(struct rtdash_ctx *ctx, const struct rtdash_snmp_config *cfg)
+{
+	return rtdash_dash_cmd(ctx, RTL_FW_SET_EXT_SNMP, 0,
+	                       sizeof(struct rtdash_snmp_config), (void *)cfg);
+}
+
+int rtdash_get_snmp(struct rtdash_ctx *ctx, struct rtdash_snmp_config *cfg)
+{
+	return rtdash_dash_cmd(ctx, RTL_FW_GET_EXT_SNMP, 0,
+	                       sizeof(struct rtdash_snmp_config), cfg);
+}
+
+int rtdash_set_wake_pattern(struct rtdash_ctx *ctx, const struct rtdash_wake_pattern *p)
+{
+	return rtdash_dash_cmd(ctx, RTL_FW_SET_WAKEUP_PATTERN, p->id,
+	                       sizeof(struct rtdash_wake_pattern), (void *)p);
+}
+
+int rtdash_get_wake_pattern(struct rtdash_ctx *ctx, uint8_t id, struct rtdash_wake_pattern *p)
+{
+	return rtdash_dash_cmd(ctx, RTL_FW_GET_WAKEUP_PATTERN, id,
+	                       sizeof(struct rtdash_wake_pattern), p);
+}
+
+int rtdash_del_wake_pattern(struct rtdash_ctx *ctx, uint8_t id)
+{
+	return rtdash_dash_cmd(ctx, RTL_FW_DEL_WAKEUP_PATTERN, id, 0, NULL);
+}
+
+int rtdash_set_arp_offload(struct rtdash_ctx *ctx, const struct rtdash_arp_offload *cfg)
+{
+	return rtdash_dash_cmd(ctx, RTL_DASH_ARP_NS_OFFLOAD, 0,
+	                       sizeof(struct rtdash_arp_offload), (void *)cfg);
 }
 
 int rtdash_push_os_data(struct rtdash_ctx *ctx, const char *hostname,

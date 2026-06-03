@@ -30,6 +30,7 @@ int rtdash_disable_diag(struct rtdash_ctx *ctx);
 
 /* DASH detection */
 bool rtdash_is_dash_capable(struct rtdash_ctx *ctx);
+uint32_t rtdash_get_fw_version(struct rtdash_ctx *ctx);
 
 /* OOB listener management */
 int rtdash_arm_req(struct rtdash_ctx *ctx);
@@ -56,6 +57,38 @@ int rtdash_disable_dash(struct rtdash_ctx *ctx);
 int rtdash_set_oob_ipmac(struct rtdash_ctx *ctx, uint32_t ip, const uint8_t *mac);
 int rtdash_set_ipv4(struct rtdash_ctx *ctx, uint32_t addr, uint32_t mask, uint32_t gw);
 int rtdash_get_ipv4(struct rtdash_ctx *ctx, uint32_t *addr, uint32_t *mask, uint32_t *gw);
+int rtdash_set_ipv6(struct rtdash_ctx *ctx, const uint8_t addr[16], uint8_t prefix, const uint8_t gw[16]);
+int rtdash_get_ipv6(struct rtdash_ctx *ctx, uint8_t addr[16], uint8_t *prefix, uint8_t gw[16]);
+
+/* SNMP configuration */
+struct rtdash_snmp_config {
+	uint32_t trap_ip;
+	uint16_t trap_port;
+	char     community[32];
+	uint8_t  enabled;
+};
+int rtdash_set_snmp(struct rtdash_ctx *ctx, const struct rtdash_snmp_config *cfg);
+int rtdash_get_snmp(struct rtdash_ctx *ctx, struct rtdash_snmp_config *cfg);
+
+/* Wake-on-LAN patterns */
+struct rtdash_wake_pattern {
+	uint8_t mask[16];
+	uint8_t pattern[128];
+	uint8_t len;
+	uint8_t id;
+};
+int rtdash_set_wake_pattern(struct rtdash_ctx *ctx, const struct rtdash_wake_pattern *p);
+int rtdash_get_wake_pattern(struct rtdash_ctx *ctx, uint8_t id, struct rtdash_wake_pattern *p);
+int rtdash_del_wake_pattern(struct rtdash_ctx *ctx, uint8_t id);
+
+/* ARP/NS offload */
+struct rtdash_arp_offload {
+	uint32_t ipv4;
+	uint8_t  ipv6[16];
+	uint8_t  mac[6];
+	uint8_t  enabled;
+};
+int rtdash_set_arp_offload(struct rtdash_ctx *ctx, const struct rtdash_arp_offload *cfg);
 
 /* OS data push (hostname, OS info) */
 int rtdash_push_os_data(struct rtdash_ctx *ctx, const char *hostname,

@@ -34,6 +34,10 @@ OPTIONS:
     -p <password>      Admin password (auto-generated if omitted)
     -4 <ip/mask/gw>    OOB IPv4 config (e.g., 192.168.1.50/255.255.255.0/192.168.1.1)
     -d                 Use DHCP for OOB network
+    -S                 Provision TLS/HTTPS self-signed certificate
+    -V                 Verify activation via realmanage CLI after setup
+    -R                 Reset DASH credentials back to factory defaults
+    -Q <ip>            Probe DASH status on a given IP without making changes
     -n                 Dry run (show what would be done)
     -h                 Show help
 
@@ -70,14 +74,14 @@ EOF
 }
 
 gen_password() {
-    # 16-char password: mixed case + digits + symbols
-    tr -dc 'A-Za-z0-9!@#$%^&*' </dev/urandom | head -c 16
+    python3 -c "import secrets; print(secrets.token_urlsafe(20)[:16])" 2>/dev/null || \
+    tr -dc "A-Za-z0-9" </dev/urandom | head -c 16
 }
 
 detect_interface() {
     local iface
-    for iface in /sys/class/net/*; do
-        iface=$(basename "$iface")
+    for iface_path in /sys/class/net/*/; do
+        iface=$(basename "$iface_path")
         [ "$iface" = "lo" ] && continue
 
         # check for Realtek DASH driver
@@ -159,6 +163,146 @@ configure_via_wsman() {
     log "Credentials configured"
 }
 
+provision_https_cert() {
+    local oob_ip="${1:-}"
+    command -v openssl >/dev/null 2>&1 || die "openssl is required for TLS certificate provisioning"
+
+    local CERT_DIR=/etc/rtdash-certs
+    mkdir -p "$CERT_DIR"
+
+    log "Generating self-signed TLS certificate..."
+    openssl req -x509 -newkey rsa:2048 \
+        -keyout "$CERT_DIR/dash-key.pem" \
+        -out "$CERT_DIR/dash-cert.pem" \
+        -days 3650 -nodes \
+        -subj "/CN=DASH-OOB/O=RealManage" 2>/dev/null
+
+    chmod 600 "$CERT_DIR/dash-key.pem"
+    log "Certificate written to $CERT_DIR/dash-cert.pem"
+    log "Private key written to $CERT_DIR/dash-key.pem"
+
+    echo ""
+    log "Certificate fingerprint:"
+    openssl x509 -in "$CERT_DIR/dash-cert.pem" -fingerprint -sha256 -noout
+    echo ""
+    echo "  To trust this certificate in browsers:"
+    echo "    Chrome:  Settings > Privacy > Security > Manage Certificates > Import"
+    echo "    Firefox: Settings > Privacy > View Certificates > Import"
+    echo "    Edge:    Settings > Privacy > Manage Certificates > Import"
+    echo "    System:  sudo cp $CERT_DIR/dash-cert.pem /usr/local/share/ca-certificates/dash-oob.crt && sudo update-ca-certificates"
+    echo ""
+
+    # attempt to push cert to BMC via WS-Man
+    if [ -n "$oob_ip" ] && command -v wsman >/dev/null 2>&1; then
+        log "Attempting to push certificate to BMC via WS-Man..."
+        local cim="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2"
+        local cert_b64
+        cert_b64=$(base64 -w0 "$CERT_DIR/dash-cert.pem" 2>/dev/null || base64 "$CERT_DIR/dash-cert.pem" 2>/dev/null)
+        wsman invoke -a "InstallFromByteStream" "${cim}/CIM_SoftwareInstallationService" \
+            -h "$oob_ip" -P 623 -u "$USERNAME" -p "$PASSWORD" -y "http" \
+            -k "Certificate=$cert_b64" \
+            -O - 2>/dev/null && log "Certificate pushed to BMC" || warn "Certificate push via WS-Man failed (manual import may be required)"
+    fi
+
+    # test HTTPS connectivity
+    if [ -n "$oob_ip" ]; then
+        if curl -sk --connect-timeout 3 "https://${oob_ip}:664" >/dev/null 2>&1; then
+            log "HTTPS working on port 664"
+        fi
+    fi
+}
+
+do_status_probe() {
+    local probe_ip="$1"
+    [ -z "$probe_ip" ] && die "-Q requires an IP address"
+
+    echo -e "${BLUE}"
+    echo "  DASH Status Probe: $probe_ip"
+    echo -e "${NC}"
+
+    # probe port 623 (HTTP/WS-Man)
+    log "Probing port 623 (HTTP/WS-Man)..."
+    if curl -s --connect-timeout 3 "http://${probe_ip}:623" >/dev/null 2>&1; then
+        log "Port 623: OPEN"
+    else
+        warn "Port 623: CLOSED or unreachable"
+    fi
+
+    # probe port 664 (HTTPS)
+    log "Probing port 664 (HTTPS)..."
+    if curl -sk --connect-timeout 3 "https://${probe_ip}:664" >/dev/null 2>&1; then
+        log "Port 664: OPEN (HTTPS)"
+    else
+        warn "Port 664: CLOSED or unreachable"
+    fi
+
+    # enumerate profiles via WS-Man
+    if command -v wsman >/dev/null 2>&1; then
+        log "Enumerating DASH profiles via WS-Man..."
+        local cim="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2"
+        local xml
+        xml=$(wsman enumerate "${cim}/CIM_RegisteredProfile" \
+            -h "$probe_ip" -P 623 -u "Administrator" -p "Realtek" -y "http" \
+            -O - 2>&1) || true
+        if echo "$xml" | grep -qi "RegisteredProfile\|DASH"; then
+            log "DASH profiles found:"
+            echo "$xml" | grep -i "RegisteredName\|RegisteredVersion" | sed 's/^/    /'
+        else
+            warn "Could not enumerate profiles (credentials may differ from defaults)"
+        fi
+    else
+        warn "wsman not installed — skipping profile enumeration"
+    fi
+
+    # try realmanage if available
+    if command -v realmanage >/dev/null 2>&1; then
+        log "Querying via realmanage..."
+        realmanage -t "$probe_ip" -u "Administrator" -P "Realtek" profiles 2>/dev/null && \
+            log "DASH is ACTIVE with default credentials" || \
+            warn "realmanage query failed (DASH may be inactive or credentials changed)"
+    fi
+
+    echo ""
+    log "Probe complete"
+}
+
+do_reset_defaults() {
+    local reset_ip="${OOB_IP:-}"
+    [ -z "$reset_ip" ] && die "OOB IP required for reset (-4 or auto-detected)"
+
+    echo -e "${YELLOW}"
+    echo "  WARNING: This will reset DASH credentials to factory defaults"
+    echo "  (Administrator / Realtek)"
+    echo -e "${NC}"
+
+    local current_pass
+    read -rsp "Enter current DASH password: " current_pass
+    echo ""
+    [ -z "$current_pass" ] && die "Password cannot be empty"
+
+    local cim="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2"
+    log "Resetting password to factory default via WS-Man..."
+    wsman invoke -a "SetPassword" "${cim}/CIM_Account" \
+        -h "$reset_ip" -P 623 -u "$USERNAME" -p "$current_pass" -y "http" \
+        -k "UserID=$USERNAME" \
+        -k "UserPassword=Realtek" \
+        -O - 2>/dev/null && log "Password reset to factory default (Realtek)" || \
+        die "Password reset failed — check current credentials and connectivity"
+}
+
+do_verify() {
+    local verify_ip="${OOB_IP:-}"
+    [ -z "$verify_ip" ] && { warn "No OOB IP — skipping verification"; return 0; }
+
+    log "Verifying activation..."
+    if command -v realmanage >/dev/null 2>&1; then
+        realmanage -t "$verify_ip" -u "$USERNAME" -P "$PASSWORD" profiles 2>/dev/null && \
+            log "Verification PASSED" || warn "Verification FAILED"
+    else
+        warn "realmanage not found — skipping verification"
+    fi
+}
+
 # --- Main ---
 
 [ "$(id -u)" -ne 0 ] && die "must run as root"
@@ -169,19 +313,33 @@ PASSWORD=""
 IPV4_CONFIG=""
 USE_DHCP=0
 DRY_RUN=0
+DO_TLS=0
+DO_VERIFY=0
+DO_RESET=0
+PROBE_IP=""
 
-while getopts "i:u:p:4:dnh" opt; do
+while getopts "i:u:p:4:dSVRQ:nh" opt; do
     case "$opt" in
         i) IFACE="$OPTARG" ;;
         u) USERNAME="$OPTARG" ;;
         p) PASSWORD="$OPTARG" ;;
         4) IPV4_CONFIG="$OPTARG" ;;
         d) USE_DHCP=1 ;;
+        S) DO_TLS=1 ;;
+        V) DO_VERIFY=1 ;;
+        R) DO_RESET=1 ;;
+        Q) PROBE_IP="$OPTARG" ;;
         n) DRY_RUN=1 ;;
         h) usage; exit 0 ;;
         *) usage; exit 1 ;;
     esac
 done
+
+# Handle status probe mode (standalone, no activation)
+if [ -n "$PROBE_IP" ]; then
+    do_status_probe "$PROBE_IP"
+    exit 0
+fi
 
 echo -e "${BLUE}"
 echo "  ╔══════════════════════════════════════════════╗"
@@ -194,6 +352,19 @@ echo -e "${NC}"
 for candidate in ./rtdash-ctl /usr/bin/rtdash-ctl /usr/local/bin/rtdash-ctl; do
     [ -x "$candidate" ] && RTDASH_CTL="$candidate" && break
 done
+
+# Handle reset mode
+if [ "$DO_RESET" -eq 1 ]; then
+    # still need OOB_IP for reset
+    OOB_IP=""
+    if [ -n "$IPV4_CONFIG" ]; then
+        OOB_IP="${IPV4_CONFIG%%/*}"
+    elif [ -n "$RTDASH_CTL" ] && [ -n "$IFACE" ]; then
+        OOB_IP=$("$RTDASH_CTL" -i "$IFACE" get-ipv4 2>/dev/null | awk '{print $1}') || true
+    fi
+    do_reset_defaults
+    exit 0
+fi
 
 # Step 1: Find interface
 if [ -z "$IFACE" ]; then
@@ -220,6 +391,9 @@ if ! check_dash_bios "$IFACE"; then
     echo "  - HP:       Advanced > Built-In Device Options > LAN DASH Support"
     echo "  - Lenovo:   Advanced > Network Setup > DASH Configuration"
     echo "  - Dell:     System Configuration > NIC Configuration > DASH Support"
+    echo "  - ASUS:     Advanced > Onboard Devices Configuration > Realtek LAN Controller DASH"
+    echo "  - MSI:      Settings > Advanced > Integrated Peripherals > Realtek DASH Support"
+    echo "  - ASRock:   Advanced > Onboard Devices Configuration > Realtek LAN DASH"
     echo ""
     read -rp "Continue anyway? [y/N] " yn
     [ "$yn" = "y" ] || [ "$yn" = "Y" ] || exit 1
@@ -245,6 +419,8 @@ elif [ "$USE_DHCP" -eq 1 ]; then
 else
     echo "    OOB Network: (keep current)"
 fi
+[ "$DO_TLS" -eq 1 ] && echo "    TLS/HTTPS:  will provision self-signed certificate"
+[ "$DO_VERIFY" -eq 1 ] && echo "    Verify:     will verify after activation"
 echo ""
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -294,7 +470,17 @@ if [ -n "$RTDASH_CTL" ]; then
     "$RTDASH_CTL" -i "$IFACE" sync-hostname || warn "sync-hostname failed"
 fi
 
-# Step 8: Verify
+# Step 8: Provision HTTPS certificate if requested
+if [ "$DO_TLS" -eq 1 ]; then
+    provision_https_cert "$OOB_IP"
+fi
+
+# Step 9: Verify activation if requested
+if [ "$DO_VERIFY" -eq 1 ]; then
+    do_verify
+fi
+
+# Step 10: Summary
 echo ""
 log "Activation complete!"
 echo ""

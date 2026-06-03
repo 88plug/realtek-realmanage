@@ -1,0 +1,7 @@
+librtdash/*.o
+librtdash/*.a
+librtdash/*.so
+librtdash/rtdash-ctl
+rtdashd/rtdashd
+librtdash/librtdash.pc
+*.bak

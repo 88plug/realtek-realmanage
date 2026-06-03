@@ -1,5 +1,6 @@
 [Unit]
 Description=Realtek RealManage DASH Client Daemon
+Documentation=man:rtdashd(8)
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/sys/class/net

@@ -4,13 +4,15 @@ LIBDIR  ?= $(PREFIX)/lib
 INCDIR  ?= $(PREFIX)/include
 UNITDIR ?= /usr/lib/systemd/system
 
+VERSION  = 0.2.0
+
 CC      ?= gcc
-CFLAGS  ?= -Wall -Wextra -O2
+CFLAGS  ?= -Wall -Wextra -O2 -std=c11
 AR      ?= ar
 
-.PHONY: all clean install uninstall
+.PHONY: all clean install uninstall check
 
-all: librtdash/librtdash.a librtdash/librtdash.so rtdashd/rtdashd librtdash/rtdash-ctl
+all: librtdash/librtdash.a librtdash/librtdash.so rtdashd/rtdashd librtdash/rtdash-ctl librtdash/librtdash.pc
 
 # Static library
 librtdash/librtdash.a: librtdash/rtdash.o
@@ -29,11 +31,19 @@ librtdash/rtdash-ctl: librtdash/rtdash-ctl.c librtdash/librtdash.a
 
 # Daemon
 rtdashd/rtdashd: rtdashd/rtdashd.c librtdash/librtdash.a
-	$(CC) $(CFLAGS) -o $@ $< -Llibrtdash -lrtdash
+	$(CC) $(CFLAGS) -o $@ $< -Llibrtdash -lrtdash -lpthread
+
+# pkg-config file
+librtdash/librtdash.pc: librtdash/librtdash.pc.in
+	sed -e "s|@PREFIX@|$(PREFIX)|g" -e "s|@VERSION@|$(VERSION)|g" $< > $@
+
+check:
+	bash -n realmanage-cli/realmanage && bash -n dash-activate/dash-activate && echo "scripts OK"
 
 clean:
 	rm -f librtdash/*.o librtdash/*.a librtdash/*.so librtdash/rtdash-ctl
 	rm -f rtdashd/rtdashd
+	rm -f librtdash/librtdash.pc
 
 install: all
 	install -Dm755 rtdashd/rtdashd $(DESTDIR)$(BINDIR)/rtdashd
@@ -45,6 +55,7 @@ install: all
 	install -Dm644 librtdash/rtdash.h $(DESTDIR)$(INCDIR)/rtdash.h
 	install -Dm644 librtdash/rtdash_ioctl.h $(DESTDIR)$(INCDIR)/rtdash_ioctl.h
 	install -Dm644 rtdashd/rtdashd.service $(DESTDIR)$(UNITDIR)/rtdashd.service
+	install -Dm644 librtdash/librtdash.pc $(DESTDIR)$(LIBDIR)/pkgconfig/librtdash.pc
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/rtdashd
@@ -56,3 +67,4 @@ uninstall:
 	rm -f $(DESTDIR)$(INCDIR)/rtdash.h
 	rm -f $(DESTDIR)$(INCDIR)/rtdash_ioctl.h
 	rm -f $(DESTDIR)$(UNITDIR)/rtdashd.service
+	rm -f $(DESTDIR)$(LIBDIR)/pkgconfig/librtdash.pc

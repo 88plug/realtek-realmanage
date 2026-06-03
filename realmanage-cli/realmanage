@@ -13,6 +13,10 @@ DEFAULT_PASS="Realtek"
 # CIM schema base URI
 CIM="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2"
 
+# Global flags
+JSON=0
+HOSTS_FILE=""
+
 usage() {
     cat <<'EOF'
 realmanage — Realtek RealManage (DMTF DASH) management CLI
@@ -27,6 +31,8 @@ OPTIONS:
     -P <pass>       Password (default: Realtek)
     -s              Use HTTPS (port 664)
     -k              Skip TLS certificate verification
+    -j              Output JSON
+    -T <file>       Fleet mode: hosts file (one host per line)
 
 COMMANDS:
     discover <ip|range>     Discover DASH-capable systems
@@ -37,6 +43,9 @@ COMMANDS:
     power off-graceful      Graceful shutdown
     power cycle             Power cycle
     power reset             Reset
+    power nmi               Non-maskable interrupt
+    power hibernate         Hibernate
+    power sleep             Sleep (light)
     cpu                     Show CPU information
     memory                  Show memory information
     bios                    Show BIOS information
@@ -57,13 +66,26 @@ COMMANDS:
     fw-update <url>         Update firmware from URL
     kvm                     Start KVM session (launches VNC)
     tcr                     Start text console redirection
+    watch [interval]        Live monitor (power + sensors, default 5s)
+    inventory               Full inventory (always JSON)
+    usb status              Show USB redirection status
+    usb mount <url>         Mount USB media from URL
+    usb unmount             Unmount USB media
+    battery                 Show battery status
+    powersupply             Show power supply status
+    asset                   Show physical asset info
+    events                  Show event subscriptions
+    events --listen         Subscribe to live events (Ctrl-C to stop)
     raw <uri> [action]      Raw WS-Man operation
     version                 Show realmanage version
 
 EXAMPLES:
     realmanage -t 192.168.1.100 info
+    realmanage -t 192.168.1.100 -j power status
     realmanage -t 192.168.1.100 power on
     realmanage -t 192.168.1.100 -s -k power status
+    realmanage -T hosts.txt -j inventory
+    realmanage -t 192.168.1.100 watch 10
     realmanage discover 192.168.1.0/24
 EOF
 }
@@ -74,6 +96,36 @@ check_deps() {
     for cmd in wsman curl xmllint; do
         command -v "$cmd" >/dev/null 2>&1 || die "missing dependency: $cmd (install wsmancli, curl, libxml2-utils)"
     done
+}
+
+# JSON output helper: takes pairs of key value args, prints {"status":"ok","data":{...}}
+json_out() {
+    local first=1
+    printf '{"status":"ok","data":{'
+    while [ $# -ge 2 ]; do
+        local k="$1" v="$2"
+        shift 2
+        # Escape backslashes and double quotes in value
+        v="${v//\\/\\\\}"
+        v="${v//\"/\\\"}"
+        v="${v//$'\n'/\\n}"
+        v="${v//$'\r'/}"
+        if [ "$first" -eq 1 ]; then
+            first=0
+        else
+            printf ','
+        fi
+        printf '"%s":"%s"' "$k" "$v"
+    done
+    printf '}}\n'
+}
+
+# JSON error output
+json_err() {
+    local msg="$1"
+    msg="${msg//\\/\\\\}"
+    msg="${msg//\"/\\\"}"
+    printf '{"status":"error","message":"%s"}\n' "$msg"
 }
 
 # WS-Man helper: enumerate instances
@@ -115,6 +167,32 @@ wsman_invoke() {
         -O - 2>/dev/null
 }
 
+# WS-Man helper: subscribe
+wsman_subscribe() {
+    local uri="$1"
+    shift
+    wsman subscribe "$uri" \
+        -h "$HOST" -P "$PORT" \
+        -u "$USER" -p "$PASS" \
+        -y "$SCHEME" \
+        ${SKIP_CERT:+-V} \
+        "$@" \
+        -O - 2>/dev/null
+}
+
+# WS-Man helper: unsubscribe
+wsman_unsubscribe() {
+    local uri="$1"
+    local identifier="$2"
+    wsman unsubscribe "$uri" \
+        -h "$HOST" -P "$PORT" \
+        -u "$USER" -p "$PASS" \
+        -y "$SCHEME" \
+        ${SKIP_CERT:+-V} \
+        -i "$identifier" \
+        2>/dev/null
+}
+
 # Extract XML element value
 xml_val() {
     local xml="$1" tag="$2"
@@ -132,10 +210,18 @@ power_state_name() {
         2)  echo "On" ;;
         3)  echo "Sleep (Light)" ;;
         4)  echo "Sleep (Deep)" ;;
+        5)  echo "Power Cycle (Off Soft)" ;;
         6)  echo "Off (Hard)" ;;
         7)  echo "Hibernate" ;;
         8)  echo "Off (Soft)" ;;
         9)  echo "Power Cycle (Off Hard)" ;;
+        10) echo "Master Bus Reset" ;;
+        11) echo "NMI" ;;
+        12) echo "Off (Soft Graceful)" ;;
+        13) echo "Off (Hard Graceful)" ;;
+        14) echo "Master Bus Reset (Graceful)" ;;
+        15) echo "Power Cycle (Off Soft Graceful)" ;;
+        16) echo "Power Cycle (Off Hard Graceful)" ;;
         *)  echo "Unknown ($1)" ;;
     esac
 }
@@ -143,24 +229,39 @@ power_state_name() {
 cmd_info() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_ComputerSystem")
-    echo "=== System Information ==="
-    echo "Name:          $(xml_val "$xml" "Name")"
-    echo "ElementName:   $(xml_val "$xml" "ElementName")"
-    echo "Description:   $(xml_val "$xml" "Description")"
+    local name elem_name desc
+    name=$(xml_val "$xml" "Name")
+    elem_name=$(xml_val "$xml" "ElementName")
+    desc=$(xml_val "$xml" "Description")
 
     local ps_xml
     ps_xml=$(wsman_enum "${CIM}/CIM_AssociatedPowerManagementService")
-    local state
+    local state state_name
     state=$(xml_val "$ps_xml" "PowerState")
-    echo "Power State:   $(power_state_name "$state")"
+    state_name=$(power_state_name "$state")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "name" "$name" "elementName" "$elem_name" "description" "$desc" "powerState" "$state_name"
+    else
+        echo "=== System Information ==="
+        echo "Name:          $name"
+        echo "ElementName:   $elem_name"
+        echo "Description:   $desc"
+        echo "Power State:   $state_name"
+    fi
 }
 
 cmd_power_status() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_AssociatedPowerManagementService")
-    local state
+    local state state_name
     state=$(xml_val "$xml" "PowerState")
-    echo "$(power_state_name "$state")"
+    state_name=$(power_state_name "$state")
+    if [ "$JSON" -eq 1 ]; then
+        json_out "powerState" "$state_name" "powerStateCode" "$state"
+    else
+        echo "$state_name"
+    fi
 }
 
 cmd_power_change() {
@@ -168,13 +269,24 @@ cmd_power_change() {
     local xml
     xml=$(wsman_invoke "${CIM}/CIM_PowerManagementService" \
         "RequestPowerStateChange" \
+        -k "CreationClassName=CIM_PowerManagementService" \
+        -k "SystemCreationClassName=CIM_ComputerSystem" \
+        -k "Name=PowerManagementService" \
         -k "PowerState=$target_state")
     local rv
     rv=$(xml_val "$xml" "ReturnValue")
     if [ "$rv" = "0" ]; then
-        echo "OK"
+        if [ "$JSON" -eq 1 ]; then
+            json_out "result" "OK" "targetState" "$target_state"
+        else
+            echo "OK"
+        fi
     else
-        echo "Failed (return=$rv)"
+        if [ "$JSON" -eq 1 ]; then
+            json_err "power state change failed (return=$rv)"
+        else
+            echo "Failed (return=$rv)"
+        fi
         return 1
     fi
 }
@@ -182,49 +294,107 @@ cmd_power_change() {
 cmd_cpu() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_Processor")
-    echo "=== CPU ==="
-    echo "Name:            $(xml_val "$xml" "ElementName")"
-    echo "Family:          $(xml_val "$xml" "Family")"
-    echo "Max Speed:       $(xml_val "$xml" "MaxClockSpeed") MHz"
-    echo "Current Speed:   $(xml_val "$xml" "CurrentClockSpeed") MHz"
-    echo "Cores:           $(xml_val "$xml" "NumberOfEnabledCores")"
-    echo "Threads:         $(xml_val "$xml" "NumberOfEnabledThreads")"
-    echo "Load:            $(xml_val "$xml" "LoadPercentage")%"
-    echo "Status:          $(xml_val "$xml" "EnabledState")"
+    local elem_name family max_speed cur_speed cores threads load status
+    elem_name=$(xml_val "$xml" "ElementName")
+    family=$(xml_val "$xml" "Family")
+    max_speed=$(xml_val "$xml" "MaxClockSpeed")
+    cur_speed=$(xml_val "$xml" "CurrentClockSpeed")
+    cores=$(xml_val "$xml" "NumberOfEnabledCores")
+    threads=$(xml_val "$xml" "NumberOfEnabledThreads")
+    load=$(xml_val "$xml" "LoadPercentage")
+    status=$(xml_val "$xml" "EnabledState")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "name" "$elem_name" "family" "$family" "maxSpeedMHz" "$max_speed" \
+            "currentSpeedMHz" "$cur_speed" "cores" "$cores" "threads" "$threads" \
+            "loadPercent" "$load" "status" "$status"
+    else
+        echo "=== CPU ==="
+        echo "Name:            $elem_name"
+        echo "Family:          $family"
+        echo "Max Speed:       $max_speed MHz"
+        echo "Current Speed:   $cur_speed MHz"
+        echo "Cores:           $cores"
+        echo "Threads:         $threads"
+        echo "Load:            ${load}%"
+        echo "Status:          $status"
+    fi
 }
 
 cmd_memory() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_PhysicalMemory")
-    echo "=== Memory ==="
-    echo "Capacity:    $(xml_val "$xml" "Capacity") bytes"
-    echo "Speed:       $(xml_val "$xml" "Speed") MHz"
-    echo "Form:        $(xml_val "$xml" "FormFactor")"
-    echo "Type:        $(xml_val "$xml" "MemoryType")"
-    echo "Manufacturer:$(xml_val "$xml" "Manufacturer")"
-    echo "Part:        $(xml_val "$xml" "PartNumber")"
-    echo "Serial:      $(xml_val "$xml" "SerialNumber")"
+    local capacity speed form mem_type mfr part serial
+    capacity=$(xml_val "$xml" "Capacity")
+    speed=$(xml_val "$xml" "Speed")
+    form=$(xml_val "$xml" "FormFactor")
+    mem_type=$(xml_val "$xml" "MemoryType")
+    mfr=$(xml_val "$xml" "Manufacturer")
+    part=$(xml_val "$xml" "PartNumber")
+    serial=$(xml_val "$xml" "SerialNumber")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "capacityBytes" "$capacity" "speedMHz" "$speed" "formFactor" "$form" \
+            "memoryType" "$mem_type" "manufacturer" "$mfr" "partNumber" "$part" \
+            "serialNumber" "$serial"
+    else
+        echo "=== Memory ==="
+        echo "Capacity:    $capacity bytes"
+        echo "Speed:       $speed MHz"
+        echo "Form:        $form"
+        echo "Type:        $mem_type"
+        echo "Manufacturer:$mfr"
+        echo "Part:        $part"
+        echo "Serial:      $serial"
+    fi
 }
 
 cmd_bios() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_BIOSElement")
-    echo "=== BIOS ==="
-    echo "Name:        $(xml_val "$xml" "Name")"
-    echo "Version:     $(xml_val "$xml" "Version")"
-    echo "Manufacturer:$(xml_val "$xml" "Manufacturer")"
-    echo "Release:     $(xml_val "$xml" "ReleaseDate")"
+    local name version mfr release
+    name=$(xml_val "$xml" "Name")
+    version=$(xml_val "$xml" "Version")
+    mfr=$(xml_val "$xml" "Manufacturer")
+    release=$(xml_val "$xml" "ReleaseDate")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "name" "$name" "version" "$version" "manufacturer" "$mfr" "releaseDate" "$release"
+    else
+        echo "=== BIOS ==="
+        echo "Name:        $name"
+        echo "Version:     $version"
+        echo "Manufacturer:$mfr"
+        echo "Release:     $release"
+    fi
 }
 
 cmd_boot() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_BootSourceSetting")
-    echo "=== Boot Configuration ==="
-    xml_vals "$xml" "BootSourceSetting" | while IFS= read -r line; do
-        local name
-        name=$(echo "$line" | xmllint --xpath "//*[local-name()='ElementName']/text()" - 2>/dev/null || true)
-        [ -n "$name" ] && echo "  - $name"
-    done
+    if [ "$JSON" -eq 1 ]; then
+        local devices=""
+        local first=1
+        while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            name="${name//\\/\\\\}"
+            name="${name//\"/\\\"}"
+            if [ "$first" -eq 1 ]; then
+                first=0
+                devices="\"$name\""
+            else
+                devices="$devices,\"$name\""
+            fi
+        done < <(echo "$xml" | xmllint --xpath "//*[local-name()='ElementName']/text()" - 2>/dev/null || true)
+        printf '{"status":"ok","data":{"bootDevices":[%s]}}\n' "$devices"
+    else
+        echo "=== Boot Configuration ==="
+        xml_vals "$xml" "BootSourceSetting" | while IFS= read -r line; do
+            local name
+            name=$(echo "$line" | xmllint --xpath "//*[local-name()='ElementName']/text()" - 2>/dev/null || true)
+            [ -n "$name" ] && echo "  - $name"
+        done
+    fi
 }
 
 cmd_boot_set() {
@@ -235,68 +405,132 @@ cmd_boot_set() {
         -k "Source=${CIM}/CIM_BootSourceSetting?ElementName=$device")
     local rv
     rv=$(xml_val "$xml" "ReturnValue")
-    [ "$rv" = "0" ] && echo "Boot device set to: $device" || echo "Failed (return=$rv)"
+    if [ "$rv" = "0" ]; then
+        [ "$JSON" -eq 1 ] && json_out "result" "OK" "device" "$device" || echo "Boot device set to: $device"
+    else
+        [ "$JSON" -eq 1 ] && json_err "boot set failed (return=$rv)" || echo "Failed (return=$rv)"
+    fi
 }
 
 cmd_fans() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_Fan")
-    echo "=== Fans ==="
-    echo "Name:        $(xml_val "$xml" "ElementName")"
-    echo "Speed:       $(xml_val "$xml" "DesiredSpeed") RPM"
-    echo "Status:      $(xml_val "$xml" "HealthState")"
+    local elem_name speed health
+    elem_name=$(xml_val "$xml" "ElementName")
+    speed=$(xml_val "$xml" "DesiredSpeed")
+    health=$(xml_val "$xml" "HealthState")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "name" "$elem_name" "speedRPM" "$speed" "healthState" "$health"
+    else
+        echo "=== Fans ==="
+        echo "Name:        $elem_name"
+        echo "Speed:       $speed RPM"
+        echo "Status:      $health"
+    fi
 }
 
 cmd_sensors() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_NumericSensor")
-    echo "=== Sensors ==="
-    echo "Name:        $(xml_val "$xml" "ElementName")"
-    echo "Reading:     $(xml_val "$xml" "CurrentReading")"
-    echo "Units:       $(xml_val "$xml" "BaseUnits")"
-    echo "Status:      $(xml_val "$xml" "HealthState")"
+    local elem_name reading units health
+    elem_name=$(xml_val "$xml" "ElementName")
+    reading=$(xml_val "$xml" "CurrentReading")
+    units=$(xml_val "$xml" "BaseUnits")
+    health=$(xml_val "$xml" "HealthState")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "name" "$elem_name" "currentReading" "$reading" "baseUnits" "$units" "healthState" "$health"
+    else
+        echo "=== Sensors ==="
+        echo "Name:        $elem_name"
+        echo "Reading:     $reading"
+        echo "Units:       $units"
+        echo "Status:      $health"
+    fi
 }
 
 cmd_os() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_OperatingSystem")
-    echo "=== Operating System ==="
-    echo "Name:        $(xml_val "$xml" "Name")"
-    echo "Version:     $(xml_val "$xml" "Version")"
-    echo "Status:      $(xml_val "$xml" "EnabledState")"
+    local name version status
+    name=$(xml_val "$xml" "Name")
+    version=$(xml_val "$xml" "Version")
+    status=$(xml_val "$xml" "EnabledState")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "name" "$name" "version" "$version" "status" "$status"
+    else
+        echo "=== Operating System ==="
+        echo "Name:        $name"
+        echo "Version:     $version"
+        echo "Status:      $status"
+    fi
 }
 
 cmd_software() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_SoftwareIdentity")
-    echo "=== Software Inventory ==="
-    echo "Name:        $(xml_val "$xml" "ElementName")"
-    echo "Version:     $(xml_val "$xml" "VersionString")"
-    echo "Manufacturer:$(xml_val "$xml" "Manufacturer")"
+    local elem_name version mfr
+    elem_name=$(xml_val "$xml" "ElementName")
+    version=$(xml_val "$xml" "VersionString")
+    mfr=$(xml_val "$xml" "Manufacturer")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "name" "$elem_name" "version" "$version" "manufacturer" "$mfr"
+    else
+        echo "=== Software Inventory ==="
+        echo "Name:        $elem_name"
+        echo "Version:     $version"
+        echo "Manufacturer:$mfr"
+    fi
 }
 
 cmd_net() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_EthernetPort")
-    echo "=== Ethernet Port ==="
-    echo "Name:        $(xml_val "$xml" "ElementName")"
-    echo "MAC:         $(xml_val "$xml" "PermanentAddress")"
-    echo "Speed:       $(xml_val "$xml" "Speed")"
-    echo "Status:      $(xml_val "$xml" "EnabledState")"
+    local elem_name mac speed status
+    elem_name=$(xml_val "$xml" "ElementName")
+    mac=$(xml_val "$xml" "PermanentAddress")
+    speed=$(xml_val "$xml" "Speed")
+    status=$(xml_val "$xml" "EnabledState")
 
-    xml=$(wsman_enum "${CIM}/CIM_IPProtocolEndpoint")
-    echo ""
-    echo "=== IP Configuration ==="
-    echo "Address:     $(xml_val "$xml" "IPv4Address")"
-    echo "Subnet:      $(xml_val "$xml" "SubnetMask")"
+    local ip_xml
+    ip_xml=$(wsman_enum "${CIM}/CIM_IPProtocolEndpoint")
+    local address subnet
+    address=$(xml_val "$ip_xml" "IPv4Address")
+    subnet=$(xml_val "$ip_xml" "SubnetMask")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "name" "$elem_name" "mac" "$mac" "speed" "$speed" "status" "$status" \
+            "ipv4Address" "$address" "subnetMask" "$subnet"
+    else
+        echo "=== Ethernet Port ==="
+        echo "Name:        $elem_name"
+        echo "MAC:         $mac"
+        echo "Speed:       $speed"
+        echo "Status:      $status"
+        echo ""
+        echo "=== IP Configuration ==="
+        echo "Address:     $address"
+        echo "Subnet:      $subnet"
+    fi
 }
 
 cmd_accounts() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_Account")
-    echo "=== Accounts ==="
-    echo "UserID:      $(xml_val "$xml" "UserID")"
-    echo "Name:        $(xml_val "$xml" "Name")"
+    local userid name
+    userid=$(xml_val "$xml" "UserID")
+    name=$(xml_val "$xml" "Name")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "userId" "$userid" "name" "$name"
+    else
+        echo "=== Accounts ==="
+        echo "UserID:      $userid"
+        echo "Name:        $name"
+    fi
 }
 
 cmd_account_add() {
@@ -350,14 +584,37 @@ cmd_log() {
 cmd_profiles() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_RegisteredProfile")
-    echo "=== Supported DASH Profiles ==="
-    echo "$xml" | xmllint --xpath "//*[local-name()='RegisteredName']/text()" - 2>/dev/null | tr ' ' '\n' || echo "N/A"
+    if [ "$JSON" -eq 1 ]; then
+        local profiles=""
+        local first=1
+        while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            name="${name//\\/\\\\}"
+            name="${name//\"/\\\"}"
+            if [ "$first" -eq 1 ]; then
+                first=0
+                profiles="\"$name\""
+            else
+                profiles="$profiles,\"$name\""
+            fi
+        done < <(echo "$xml" | xmllint --xpath "//*[local-name()='RegisteredName']/text()" - 2>/dev/null || true)
+        printf '{"status":"ok","data":{"profiles":[%s]}}\n' "$profiles"
+    else
+        echo "=== Supported DASH Profiles ==="
+        echo "$xml" | xmllint --xpath "//*[local-name()='RegisteredName']/text()" - 2>/dev/null | tr ' ' '\n' || echo "N/A"
+    fi
 }
 
 cmd_fw_version() {
     local xml
     xml=$(wsman_enum "${CIM}/CIM_SoftwareIdentity")
-    echo "DASH FW: $(xml_val "$xml" "VersionString")"
+    local version
+    version=$(xml_val "$xml" "VersionString")
+    if [ "$JSON" -eq 1 ]; then
+        json_out "firmwareVersion" "$version"
+    else
+        echo "DASH FW: $version"
+    fi
 }
 
 cmd_fw_update() {
@@ -437,6 +694,289 @@ cmd_raw() {
     esac
 }
 
+cmd_watch() {
+    local interval="${1:-5}"
+    if [ "$JSON" -eq 1 ]; then
+        die "watch command is not available in JSON mode"
+    fi
+    trap 'printf "\nWatch stopped.\n"; exit 0' INT
+    while true; do
+        clear
+        printf "=== realmanage watch: %s @ %s ===\n\n" "$HOST" "$(date '+%Y-%m-%d %H:%M:%S')"
+
+        local ps_xml
+        ps_xml=$(wsman_enum "${CIM}/CIM_AssociatedPowerManagementService" 2>/dev/null || true)
+        local state
+        state=$(xml_val "$ps_xml" "PowerState")
+        printf "Power State: %s\n\n" "$(power_state_name "$state")"
+
+        local sensor_xml
+        sensor_xml=$(wsman_enum "${CIM}/CIM_NumericSensor" 2>/dev/null || true)
+        printf "Sensor:  %s\n" "$(xml_val "$sensor_xml" "ElementName")"
+        printf "Reading: %s\n" "$(xml_val "$sensor_xml" "CurrentReading")"
+        printf "Units:   %s\n" "$(xml_val "$sensor_xml" "BaseUnits")"
+        printf "Health:  %s\n" "$(xml_val "$sensor_xml" "HealthState")"
+
+        sleep "$interval"
+    done
+}
+
+cmd_inventory() {
+    # Always JSON output regardless of -j flag
+    local saved_json=$JSON
+    JSON=1
+
+    local sys cpu mem bios boot fans sensors os_info sw net profiles
+
+    sys=$(cmd_info)
+    cpu=$(cmd_cpu)
+    mem=$(cmd_memory)
+    bios=$(cmd_bios)
+    boot=$(cmd_boot)
+    fans=$(cmd_fans)
+    sensors=$(cmd_sensors)
+    os_info=$(cmd_os)
+    sw=$(cmd_software)
+    net=$(cmd_net)
+    profiles=$(cmd_profiles)
+
+    JSON=$saved_json
+
+    # Extract the data objects from each sub-result
+    # Each returns {"status":"ok","data":{...}} -- extract the data value
+    local extract='s/^{"status":"ok","data":\(.*\)}$/\1/'
+
+    local s_sys s_cpu s_mem s_bios s_boot s_fans s_sensors s_os s_sw s_net s_profiles
+    s_sys=$(echo "$sys" | sed "$extract")
+    s_cpu=$(echo "$cpu" | sed "$extract")
+    s_mem=$(echo "$mem" | sed "$extract")
+    s_bios=$(echo "$bios" | sed "$extract")
+    s_boot=$(echo "$boot" | sed "$extract")
+    s_fans=$(echo "$fans" | sed "$extract")
+    s_sensors=$(echo "$sensors" | sed "$extract")
+    s_os=$(echo "$os_info" | sed "$extract")
+    s_sw=$(echo "$sw" | sed "$extract")
+    s_net=$(echo "$net" | sed "$extract")
+    s_profiles=$(echo "$profiles" | sed "$extract")
+
+    printf '{"status":"ok","data":{"system":%s,"cpu":%s,"memory":%s,"bios":%s,"boot":%s,"fans":%s,"sensors":%s,"os":%s,"software":%s,"net":%s,"profiles":%s}}\n' \
+        "$s_sys" "$s_cpu" "$s_mem" "$s_bios" "$s_boot" "$s_fans" "$s_sensors" "$s_os" "$s_sw" "$s_net" "$s_profiles"
+}
+
+cmd_usb_status() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_USBRedirectionSAP")
+    local elem_name enabled_state requested_state
+    elem_name=$(xml_val "$xml" "ElementName")
+    enabled_state=$(xml_val "$xml" "EnabledState")
+    requested_state=$(xml_val "$xml" "RequestedState")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "name" "$elem_name" "enabledState" "$enabled_state" "requestedState" "$requested_state"
+    else
+        echo "=== USB Redirection ==="
+        echo "Name:        $elem_name"
+        echo "State:       $enabled_state"
+        echo "Requested:   $requested_state"
+    fi
+}
+
+cmd_usb_mount() {
+    local url="$1"
+    local xml
+    xml=$(wsman_invoke "${CIM}/CIM_USBRedirectionSAP" \
+        "RequestStateChange" \
+        -k "RequestedState=2" \
+        -k "URI=$url")
+    local rv
+    rv=$(xml_val "$xml" "ReturnValue")
+    if [ "$rv" = "0" ]; then
+        [ "$JSON" -eq 1 ] && json_out "result" "OK" "url" "$url" || echo "USB mounted: $url"
+    else
+        [ "$JSON" -eq 1 ] && json_err "usb mount failed (return=$rv)" || echo "Failed (return=$rv)"
+    fi
+}
+
+cmd_usb_unmount() {
+    local xml
+    xml=$(wsman_invoke "${CIM}/CIM_USBRedirectionSAP" \
+        "RequestStateChange" \
+        -k "RequestedState=3")
+    local rv
+    rv=$(xml_val "$xml" "ReturnValue")
+    if [ "$rv" = "0" ]; then
+        [ "$JSON" -eq 1 ] && json_out "result" "OK" || echo "USB unmounted"
+    else
+        [ "$JSON" -eq 1 ] && json_err "usb unmount failed (return=$rv)" || echo "Failed (return=$rv)"
+    fi
+}
+
+cmd_battery() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_Battery")
+    local elem_name charge runtime bat_status
+    elem_name=$(xml_val "$xml" "ElementName")
+    charge=$(xml_val "$xml" "EstimatedChargeRemaining")
+    runtime=$(xml_val "$xml" "EstimatedRunTime")
+    bat_status=$(xml_val "$xml" "BatteryStatus")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "name" "$elem_name" "chargePercent" "$charge" "estimatedRunTimeMinutes" "$runtime" "batteryStatus" "$bat_status"
+    else
+        echo "=== Battery ==="
+        echo "Name:        $elem_name"
+        echo "Charge:      ${charge}%"
+        echo "Run Time:    $runtime min"
+        echo "Status:      $bat_status"
+    fi
+}
+
+cmd_powersupply() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_PowerSupply")
+    local elem_name op_status total_power
+    elem_name=$(xml_val "$xml" "ElementName")
+    op_status=$(xml_val "$xml" "OperationalStatus")
+    total_power=$(xml_val "$xml" "TotalOutputPower")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "name" "$elem_name" "operationalStatus" "$op_status" "totalOutputPower" "$total_power"
+    else
+        echo "=== Power Supply ==="
+        echo "Name:        $elem_name"
+        echo "Status:      $op_status"
+        echo "Output:      $total_power W"
+    fi
+}
+
+cmd_asset() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_PhysicalPackage")
+    local mfr model serial part
+    mfr=$(xml_val "$xml" "Manufacturer")
+    model=$(xml_val "$xml" "Model")
+    serial=$(xml_val "$xml" "SerialNumber")
+    part=$(xml_val "$xml" "PartNumber")
+
+    if [ "$JSON" -eq 1 ]; then
+        json_out "manufacturer" "$mfr" "model" "$model" "serialNumber" "$serial" "partNumber" "$part"
+    else
+        echo "=== Physical Asset ==="
+        echo "Manufacturer: $mfr"
+        echo "Model:        $model"
+        echo "Serial:       $serial"
+        echo "Part:         $part"
+    fi
+}
+
+cmd_events() {
+    local xml
+    xml=$(wsman_enum "${CIM}/CIM_IndicationFilter")
+    if [ "$JSON" -eq 1 ]; then
+        local filters=""
+        local first=1
+        while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            name="${name//\\/\\\\}"
+            name="${name//\"/\\\"}"
+            if [ "$first" -eq 1 ]; then
+                first=0
+                filters="\"$name\""
+            else
+                filters="$filters,\"$name\""
+            fi
+        done < <(echo "$xml" | xmllint --xpath "//*[local-name()='Name']/text()" - 2>/dev/null || true)
+        printf '{"status":"ok","data":{"filters":[%s]}}\n' "$filters"
+    else
+        echo "=== Event Subscriptions ==="
+        echo "$xml" | xmllint --format - 2>/dev/null || echo "$xml"
+    fi
+}
+
+cmd_events_listen() {
+    local sub_id=""
+
+    cleanup_subscription() {
+        if [ -n "$sub_id" ]; then
+            echo ""
+            echo "Unsubscribing ($sub_id)..."
+            wsman_unsubscribe "${CIM}/CIM_AlertIndication" "$sub_id" || true
+        fi
+        echo "Event listener stopped."
+        exit 0
+    }
+
+    trap cleanup_subscription INT TERM
+
+    echo "Subscribing to CIM_AlertIndication on $HOST..."
+    local sub_xml
+    sub_xml=$(wsman_subscribe "${CIM}/CIM_AlertIndication" \
+        -m "push" \
+        -N "http://schemas.dmtf.org/wbem/wsman/1/wsman/Events" 2>/dev/null || true)
+
+    sub_id=$(xml_val "$sub_xml" "Identifier")
+    if [ "$sub_id" = "N/A" ] || [ -z "$sub_id" ]; then
+        echo "Warning: could not extract subscription identifier"
+        sub_id=""
+    else
+        echo "Subscribed (id: $sub_id)"
+    fi
+
+    echo "Listening for events (Ctrl-C to stop)..."
+    while true; do
+        local event_xml
+        event_xml=$(wsman_enum "${CIM}/CIM_AlertIndication" 2>/dev/null || true)
+        if [ -n "$event_xml" ]; then
+            local desc severity
+            desc=$(xml_val "$event_xml" "Description")
+            severity=$(xml_val "$event_xml" "PerceivedSeverity")
+            if [ "$desc" != "N/A" ]; then
+                printf "[%s] severity=%s: %s\n" "$(date '+%H:%M:%S')" "$severity" "$desc"
+            fi
+        fi
+        sleep 2
+    done
+}
+
+# Fleet mode: run a command function against multiple hosts
+run_fleet() {
+    local cmd_func="$1"
+    shift
+    local hosts_file="$HOSTS_FILE"
+    local original_host="$HOST"
+
+    if [ "$JSON" -eq 1 ]; then
+        local first=1
+        printf '['
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%%#*}"    # strip comments
+            line="${line// /}"   # strip spaces
+            [ -z "$line" ] && continue
+            HOST="$line"
+            local output
+            output=$("$cmd_func" "$@" 2>/dev/null || echo '{"status":"error","message":"command failed"}')
+            if [ "$first" -eq 1 ]; then
+                first=0
+            else
+                printf ','
+            fi
+            printf '{"host":"%s","data":%s}' "$HOST" "$output"
+        done < "$hosts_file"
+        printf ']\n'
+    else
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%%#*}"
+            line="${line// /}"
+            [ -z "$line" ] && continue
+            HOST="$line"
+            printf "\n--- %s ---\n" "$HOST"
+            "$cmd_func" "$@" || true
+        done < "$hosts_file"
+    fi
+
+    HOST="$original_host"
+}
+
 # --- Main ---
 
 HOST=""
@@ -446,7 +986,7 @@ PASS="$DEFAULT_PASS"
 SCHEME="http"
 SKIP_CERT=""
 
-while getopts "t:p:u:P:skh" opt; do
+while getopts "t:p:u:P:skhjT:" opt; do
     case "$opt" in
         t) HOST="$OPTARG" ;;
         p) PORT="$OPTARG" ;;
@@ -454,6 +994,8 @@ while getopts "t:p:u:P:skh" opt; do
         P) PASS="$OPTARG" ;;
         s) SCHEME="https"; [ "$PORT" = "$DEFAULT_PORT" ] && PORT=664 ;;
         k) SKIP_CERT=1 ;;
+        j) JSON=1 ;;
+        T) HOSTS_FILE="$OPTARG" ;;
         h) usage; exit 0 ;;
         *) usage; exit 1 ;;
     esac
@@ -464,72 +1006,145 @@ shift $((OPTIND - 1))
 
 CMD="$1"; shift
 
-case "$CMD" in
-    version)  echo "realmanage $VERSION" ;;
-    discover)
-        [ $# -lt 1 ] && die "usage: realmanage discover <ip|range>"
-        cmd_discover "$1"
-        ;;
-    *)
-        [ -z "$HOST" ] && die "target host required (-t <host>)"
-        check_deps
-        case "$CMD" in
-            info)       cmd_info ;;
-            power)
-                [ $# -lt 1 ] && die "usage: realmanage power <status|on|off|off-graceful|cycle|reset>"
-                case "$1" in
-                    status)       cmd_power_status ;;
-                    on)           cmd_power_change 2 ;;
-                    off)          cmd_power_change 6 ;;
-                    off-graceful) cmd_power_change 12 ;;
-                    cycle)        cmd_power_change 5 ;;
-                    reset)        cmd_power_change 10 ;;
-                    *)            die "unknown power command: $1" ;;
-                esac
-                ;;
-            cpu)        cmd_cpu ;;
-            memory)     cmd_memory ;;
-            bios)       cmd_bios ;;
-            boot)
-                if [ $# -gt 0 ] && [ "$1" = "set" ]; then
-                    [ $# -lt 2 ] && die "usage: realmanage boot set <device>"
-                    cmd_boot_set "$2"
-                else
-                    cmd_boot
-                fi
-                ;;
-            fans)       cmd_fans ;;
-            sensors)    cmd_sensors ;;
-            os)         cmd_os ;;
-            software)   cmd_software ;;
-            net)        cmd_net ;;
-            accounts)   cmd_accounts ;;
-            account)
-                [ $# -lt 1 ] && die "usage: realmanage account <add|del> ..."
-                case "$1" in
-                    add) [ $# -lt 4 ] && die "usage: realmanage account add <user> <pass> <role>"; cmd_account_add "$2" "$3" "$4" ;;
-                    del) [ $# -lt 2 ] && die "usage: realmanage account del <user>"; cmd_account_del "$2" ;;
-                    *)   die "unknown account command: $1" ;;
-                esac
-                ;;
-            password)
-                [ $# -lt 2 ] && die "usage: realmanage password <user> <pass>"
-                cmd_password "$1" "$2"
-                ;;
-            log)        cmd_log ;;
-            profiles)   cmd_profiles ;;
-            fw-version) cmd_fw_version ;;
-            fw-update)
-                [ $# -lt 1 ] && die "usage: realmanage fw-update <url>"
-                cmd_fw_update "$1"
-                ;;
-            kvm)        cmd_kvm ;;
-            tcr)        cmd_tcr ;;
-            raw)
-                [ $# -lt 1 ] && die "usage: realmanage raw <uri> [enumerate|get]"
-                cmd_raw "$1" "${2:-enumerate}"
-                ;;
-            *)          die "unknown command: $CMD" ;;
-        esac
-        ;;
-esac
+# Determine the command to dispatch and wrap in fleet mode if needed
+dispatch_command() {
+    case "$CMD" in
+        version)  echo "realmanage $VERSION" ;;
+        discover)
+            [ $# -lt 1 ] && die "usage: realmanage discover <ip|range>"
+            cmd_discover "$1"
+            ;;
+        *)
+            [ -z "$HOST" ] && [ -z "$HOSTS_FILE" ] && die "target host required (-t <host> or -T <hosts_file>)"
+            check_deps
+            case "$CMD" in
+                info)       cmd_info ;;
+                power)
+                    [ $# -lt 1 ] && die "usage: realmanage power <status|on|off|off-graceful|cycle|reset|nmi|hibernate|sleep>"
+                    case "$1" in
+                        status)       cmd_power_status ;;
+                        on)           cmd_power_change 2 ;;
+                        off)          cmd_power_change 6 ;;
+                        off-graceful) cmd_power_change 12 ;;
+                        cycle)        cmd_power_change 5 ;;
+                        reset)        cmd_power_change 10 ;;
+                        nmi)          cmd_power_change 11 ;;
+                        hibernate)    cmd_power_change 7 ;;
+                        sleep)        cmd_power_change 3 ;;
+                        *)            die "unknown power command: $1" ;;
+                    esac
+                    ;;
+                cpu)        cmd_cpu ;;
+                memory)     cmd_memory ;;
+                bios)       cmd_bios ;;
+                boot)
+                    if [ $# -gt 0 ] && [ "$1" = "set" ]; then
+                        [ $# -lt 2 ] && die "usage: realmanage boot set <device>"
+                        cmd_boot_set "$2"
+                    else
+                        cmd_boot
+                    fi
+                    ;;
+                fans)       cmd_fans ;;
+                sensors)    cmd_sensors ;;
+                os)         cmd_os ;;
+                software)   cmd_software ;;
+                net)        cmd_net ;;
+                accounts)   cmd_accounts ;;
+                account)
+                    [ $# -lt 1 ] && die "usage: realmanage account <add|del> ..."
+                    case "$1" in
+                        add) [ $# -lt 4 ] && die "usage: realmanage account add <user> <pass> <role>"; cmd_account_add "$2" "$3" "$4" ;;
+                        del) [ $# -lt 2 ] && die "usage: realmanage account del <user>"; cmd_account_del "$2" ;;
+                        *)   die "unknown account command: $1" ;;
+                    esac
+                    ;;
+                password)
+                    [ $# -lt 2 ] && die "usage: realmanage password <user> <pass>"
+                    cmd_password "$1" "$2"
+                    ;;
+                log)        cmd_log ;;
+                profiles)   cmd_profiles ;;
+                fw-version) cmd_fw_version ;;
+                fw-update)
+                    [ $# -lt 1 ] && die "usage: realmanage fw-update <url>"
+                    cmd_fw_update "$1"
+                    ;;
+                kvm)        cmd_kvm ;;
+                tcr)        cmd_tcr ;;
+                watch)      cmd_watch "${1:-5}" ;;
+                inventory)  cmd_inventory ;;
+                usb)
+                    [ $# -lt 1 ] && die "usage: realmanage usb <status|mount|unmount>"
+                    case "$1" in
+                        status)  cmd_usb_status ;;
+                        mount)
+                            [ $# -lt 2 ] && die "usage: realmanage usb mount <url>"
+                            cmd_usb_mount "$2"
+                            ;;
+                        unmount) cmd_usb_unmount ;;
+                        *)       die "unknown usb command: $1" ;;
+                    esac
+                    ;;
+                battery)    cmd_battery ;;
+                powersupply) cmd_powersupply ;;
+                asset)      cmd_asset ;;
+                events)
+                    if [ $# -gt 0 ] && [ "$1" = "--listen" ]; then
+                        cmd_events_listen
+                    else
+                        cmd_events
+                    fi
+                    ;;
+                raw)
+                    [ $# -lt 1 ] && die "usage: realmanage raw <uri> [enumerate|get]"
+                    cmd_raw "$1" "${2:-enumerate}"
+                    ;;
+                *)          die "unknown command: $CMD" ;;
+            esac
+            ;;
+    esac
+}
+
+# Fleet mode: if HOSTS_FILE is set, iterate over hosts
+if [ -n "$HOSTS_FILE" ]; then
+    [ ! -f "$HOSTS_FILE" ] && die "hosts file not found: $HOSTS_FILE"
+    # Commands that don't need a host
+    case "$CMD" in
+        version|discover)
+            dispatch_command "$@"
+            ;;
+        *)
+            original_args=("$@")
+            if [ "$JSON" -eq 1 ]; then
+                first_host=1
+                printf '['
+                while IFS= read -r line || [ -n "$line" ]; do
+                    line="${line%%#*}"
+                    line="$(echo "$line" | tr -d '[:space:]')"
+                    [ -z "$line" ] && continue
+                    HOST="$line"
+                    output=$(dispatch_command "${original_args[@]}" 2>&1 || true)
+                    if [ "$first_host" -eq 1 ]; then
+                        first_host=0
+                    else
+                        printf ','
+                    fi
+                    printf '{"host":"%s","data":%s}' "$HOST" "$output"
+                done < "$HOSTS_FILE"
+                printf ']\n'
+            else
+                while IFS= read -r line || [ -n "$line" ]; do
+                    line="${line%%#*}"
+                    line="$(echo "$line" | tr -d '[:space:]')"
+                    [ -z "$line" ] && continue
+                    HOST="$line"
+                    printf "\n--- %s ---\n" "$HOST"
+                    dispatch_command "${original_args[@]}" || true
+                done < "$HOSTS_FILE"
+            fi
+            ;;
+    esac
+else
+    dispatch_command "$@"
+fi
