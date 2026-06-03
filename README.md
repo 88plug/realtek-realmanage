@@ -89,24 +89,51 @@ sudo dash-activate -i enp3s0 -u admin -p 'MyP@ss123' -4 192.168.1.50/255.255.255
 # System info
 realmanage -t 192.168.1.50 info
 
-# Power control
+# JSON output (scriptable/pipeable)
+realmanage -j -t 192.168.1.50 info | jq .
+realmanage -j -t 192.168.1.50 power status
+
+# Fleet management (run against multiple hosts)
+realmanage -j -T hosts.txt power status
+
+# Power control (all 16 DASH states)
 realmanage -t 192.168.1.50 power status
 realmanage -t 192.168.1.50 power on
 realmanage -t 192.168.1.50 power off-graceful
 realmanage -t 192.168.1.50 power cycle
+realmanage -t 192.168.1.50 power hibernate
+realmanage -t 192.168.1.50 power nmi
 
 # Hardware inventory
 realmanage -t 192.168.1.50 cpu
 realmanage -t 192.168.1.50 memory
 realmanage -t 192.168.1.50 bios
 realmanage -t 192.168.1.50 sensors
+realmanage -t 192.168.1.50 fans
+realmanage -t 192.168.1.50 battery
+realmanage -t 192.168.1.50 powersupply
+realmanage -t 192.168.1.50 asset
+
+# Full inventory dump (always JSON)
+realmanage -t 192.168.1.50 inventory > host-inventory.json
+
+# Continuous monitor
+realmanage -t 192.168.1.50 watch 10
 
 # KVM remote desktop
 realmanage -t 192.168.1.50 kvm
 
+# USB/ISO redirection
+realmanage -t 192.168.1.50 usb mount http://fileserver/ubuntu.iso
+realmanage -t 192.168.1.50 usb unmount
+
 # Boot control
 realmanage -t 192.168.1.50 boot
 realmanage -t 192.168.1.50 boot set PXE
+
+# Event monitoring
+realmanage -t 192.168.1.50 events
+realmanage -t 192.168.1.50 events --listen
 
 # Discover DASH systems on network
 realmanage discover 192.168.1.0/24
@@ -121,17 +148,67 @@ realmanage -t 192.168.1.50 raw http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2
 # Check if NIC supports DASH
 sudo rtdash-ctl -i enp3s0 check
 
-# Query OOB IP configuration
-sudo rtdash-ctl -i enp3s0 get-ipv4
+# DASH firmware version
+sudo rtdash-ctl -i enp3s0 dash-version
 
-# Set OOB IP
+# NIC MAC address
+sudo rtdash-ctl -i enp3s0 mac-get
+
+# IPv4/IPv6 OOB configuration
+sudo rtdash-ctl -i enp3s0 get-ipv4
 sudo rtdash-ctl -i enp3s0 set-ipv4 192.168.1.50 255.255.255.0 192.168.1.1
+sudo rtdash-ctl -i enp3s0 get-ipv6
+sudo rtdash-ctl -i enp3s0 set-ipv6 fe80::1 64 fe80::1
+
+# SNMP trap configuration
+sudo rtdash-ctl -i enp3s0 snmp-set 192.168.1.1 162 public
+sudo rtdash-ctl -i enp3s0 snmp-get
+
+# Wake-on-LAN patterns
+sudo rtdash-ctl -i enp3s0 wake-pattern-set 0 ffffffffffff
+sudo rtdash-ctl -i enp3s0 wake-pattern-get 0
+sudo rtdash-ctl -i enp3s0 wake-pattern-del 0
+
+# ARP/NS offload
+sudo rtdash-ctl -i enp3s0 arp-offload-set 192.168.1.50 fe80::1 aa:bb:cc:dd:ee:ff 1
 
 # Send driver ready signal
 sudo rtdash-ctl -i enp3s0 driver-ready
 
 # Sync hostname to firmware
 sudo rtdash-ctl -i enp3s0 sync-hostname
+```
+
+### Prometheus Metrics (rtdashd)
+
+`rtdashd` exposes Prometheus metrics on port 9101:
+
+```
+# curl http://localhost:9101/metrics
+rtdash_driver_ready_total 1
+rtdash_oob_messages_total 0
+rtdash_last_push_timestamp 1748900000
+rtdash_hostname_syncs_total 3
+```
+
+Configure via `/etc/rtdashd.conf`:
+
+```ini
+INTERFACE=enp3s0
+METRICS_PORT=9101
+PUSH_INTERVAL=30
+```
+
+Or CLI: `rtdashd -m 9101 -I 30 -i enp3s0`
+
+### HTTPS Certificate Provisioning
+
+```bash
+# Generate self-signed cert and push to NIC (Class B / port 664)
+sudo dash-activate -S -t 192.168.1.50
+
+# Then manage securely
+realmanage -s -k -t 192.168.1.50 info
 ```
 
 ## How It Works

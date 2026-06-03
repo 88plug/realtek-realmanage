@@ -36,12 +36,6 @@ static void usage(const char *prog)
 	fprintf(stderr, "  recv                           Receive OOB message from firmware\n");
 }
 
-static void print_mac(const uint8_t *m)
-{
-	printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
-	       m[0], m[1], m[2], m[3], m[4], m[5]);
-}
-
 static int parse_hex(const char *s, uint8_t *out, size_t max_len)
 {
 	size_t i;
@@ -110,16 +104,19 @@ int main(int argc, char *argv[])
 			       (ver >> 8) & 0xFF, ver & 0xFF);
 
 	} else if (strcmp(cmd, "mac-get") == 0) {
-		struct rtltool_cmd_struct tool = { .cmd = RTL_READ_MAC, .offset = 0, .len = 6 };
-		struct ifreq ifr;
-		memset(&ifr, 0, sizeof(ifr));
-		strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
-		ifr.ifr_data = (void *)&tool;
-		if (ioctl(ctx.sock, SIOCRTLTOOL, &ifr) < 0) {
+		char path[64], mac[18] = "";
+		FILE *fp;
+		snprintf(path, sizeof(path), "/sys/class/net/%s/address", ifname);
+		fp = fopen(path, "r");
+		if (!fp) {
 			perror("mac-get");
 			ret = 1;
 		} else {
-			print_mac((const uint8_t *)&tool.data);
+			if (fgets(mac, sizeof(mac), fp)) {
+				mac[strcspn(mac, "\n")] = '\0';
+				printf("%s\n", mac);
+			}
+			fclose(fp);
 		}
 
 	} else if (strcmp(cmd, "driver-ready") == 0) {

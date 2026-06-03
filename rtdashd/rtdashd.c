@@ -47,7 +47,8 @@ static void sighup_handler(int sig)
 	char c = 1;
 	if (sig_pipe[1] >= 0) {
 		int saved = errno;
-		(void)write(sig_pipe[1], &c, 1);
+		ssize_t _r = write(sig_pipe[1], &c, 1);
+		(void)_r;
 		errno = saved;
 	}
 }
@@ -143,8 +144,7 @@ static void parse_config(const char *path, char *ifname, int *mp, int *pi)
 			continue;
 
 		if (strcmp(key, "INTERFACE") == 0) {
-			strncpy(ifname, val, 15);
-			ifname[15] = '\0';
+			snprintf(ifname, 16, "%.15s", val);
 		} else if (strcmp(key, "METRICS_PORT") == 0) {
 			int v = atoi(val);
 			if (v >= 0 && v <= 65535)
@@ -204,7 +204,7 @@ static void *metrics_thread_func(void *arg)
 
 		/* Read and discard request */
 		char reqbuf[1024];
-		(void)read(client, reqbuf, sizeof(reqbuf));
+		{ ssize_t _r = read(client, reqbuf, sizeof(reqbuf)); (void)_r; }
 
 		char body[2048];
 		int blen = snprintf(body, sizeof(body),
@@ -231,8 +231,8 @@ static void *metrics_thread_func(void *arg)
 			"Content-Type: text/plain; version=0.0.4\r\n"
 			"\r\n");
 
-		(void)write(client, hdr, (size_t)hlen);
-		(void)write(client, body, (size_t)blen);
+		{ ssize_t _r = write(client, hdr, (size_t)hlen); (void)_r; }
+		{ ssize_t _r = write(client, body, (size_t)blen); (void)_r; }
 		close(client);
 	}
 
@@ -270,8 +270,7 @@ static int find_dash_interface(char *ifname, size_t len)
 				bool capable = rtdash_is_dash_capable(&probe);
 				rtdash_disable_diag(&probe);
 				if (capable) {
-					strncpy(ifname, line, len - 1);
-					ifname[len - 1] = '\0';
+					snprintf(ifname, len, "%.*s", (int)(len - 1), line);
 					rtdash_close(&probe);
 					pclose(fp);
 					return 0;
@@ -460,7 +459,7 @@ int main(int argc, char *argv[])
 			if (events[i].data.fd == tfd) {
 				/* Timer fired: heartbeat push */
 				uint64_t expirations;
-				(void)read(tfd, &expirations, sizeof(expirations));
+				{ ssize_t _r = read(tfd, &expirations, sizeof(expirations)); (void)_r; }
 
 				struct rtdash_msg msg;
 				if (rtdash_recv(&ctx, &msg) == 0) {

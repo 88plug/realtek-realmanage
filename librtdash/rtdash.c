@@ -24,7 +24,7 @@ static int rtdash_rtltool_cmd(struct rtdash_ctx *ctx, uint32_t cmd,
 	};
 
 	memset(&ifr, 0, sizeof(ifr));
-	strncpy(ifr.ifr_name, ctx->ifname, IFNAMSIZ - 1);
+	memcpy(ifr.ifr_name, ctx->ifname, IFNAMSIZ);
 	ifr.ifr_data = (void *)&tool;
 
 	return ioctl(ctx->sock, SIOCRTLTOOL, &ifr);
@@ -42,7 +42,7 @@ static int rtdash_dash_cmd(struct rtdash_ctx *ctx, uint32_t cmd,
 	dash.data_buffer = buf;
 
 	memset(&ifr, 0, sizeof(ifr));
-	strncpy(ifr.ifr_name, ctx->ifname, IFNAMSIZ - 1);
+	memcpy(ifr.ifr_name, ctx->ifname, IFNAMSIZ);
 	ifr.ifr_data = (void *)&dash;
 
 	return ioctl(ctx->sock, SIOCDEVPRIVATE_RTLDASH, &ifr);
@@ -113,7 +113,7 @@ uint32_t rtdash_get_fw_version(struct rtdash_ctx *ctx)
 	struct ifreq ifr;
 
 	memset(&ifr, 0, sizeof(ifr));
-	strncpy(ifr.ifr_name, ctx->ifname, IFNAMSIZ - 1);
+	memcpy(ifr.ifr_name, ctx->ifname, IFNAMSIZ);
 	ifr.ifr_data = (void *)&tool;
 
 	if (ioctl(ctx->sock, SIOCRTLTOOL, &ifr) < 0)

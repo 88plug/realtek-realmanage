@@ -1,6 +1,6 @@
 # Maintainer: Andrew <claude@null.pet>
 pkgname=realtek-realmanage
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Linux toolkit for Realtek RealManage (DMTF DASH) out-of-band management'
 arch=('x86_64')
