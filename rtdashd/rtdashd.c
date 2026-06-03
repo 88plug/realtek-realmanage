@@ -21,6 +21,7 @@
 #include <dirent.h>
 
 #include "../librtdash/rtdash.h"
+#include "../librtdash/rtdash_ioctl.h"
 
 static volatile int running = 1;
 
@@ -416,7 +417,7 @@ int main(int argc, char *argv[])
 		if (npkg >= 0 && pkgbuf[0]) {
 			syslog(LOG_INFO, "pushing software inventory (%d packages)", npkg);
 			/* Send as type 0x04 payload */
-			rtdash_send(&ctx, pkgbuf, (uint16_t)strlen(pkgbuf), 0x04);
+			rtdash_send(&ctx, pkgbuf, (uint16_t)strlen(pkgbuf), DASH_OOB_HDR_TYPE_ACK);
 		}
 	}
 
@@ -502,7 +503,7 @@ int main(int argc, char *argv[])
 				char pkgbuf[4096];
 				int npkg = get_installed_packages(pkgbuf, sizeof(pkgbuf));
 				if (npkg >= 0 && pkgbuf[0])
-					rtdash_send(&ctx, pkgbuf, (uint16_t)strlen(pkgbuf), 0x04);
+					rtdash_send(&ctx, pkgbuf, (uint16_t)strlen(pkgbuf), DASH_OOB_HDR_TYPE_ACK);
 			}
 		}
 	}

@@ -760,7 +760,9 @@ cmd_inventory() {
     s_profiles=$(echo "$profiles" | sed "$extract")
 
     printf '{"status":"ok","data":{"system":%s,"cpu":%s,"memory":%s,"bios":%s,"boot":%s,"fans":%s,"sensors":%s,"os":%s,"software":%s,"net":%s,"profiles":%s}}\n' \
-        "$s_sys" "$s_cpu" "$s_mem" "$s_bios" "$s_boot" "$s_fans" "$s_sensors" "$s_os" "$s_sw" "$s_net" "$s_profiles"
+        "${s_sys:-{}}" "${s_cpu:-{}}" "${s_mem:-{}}" "${s_bios:-{}}" "${s_boot:-{}}" \
+        "${s_fans:-{}}" "${s_sensors:-{}}" "${s_os:-{}}" "${s_sw:-{}}" "${s_net:-{}}" \
+        "${s_profiles:-{}}"
 }
 
 cmd_usb_status() {
@@ -1124,7 +1126,8 @@ if [ -n "$HOSTS_FILE" ]; then
                     line="$(echo "$line" | tr -d '[:space:]')"
                     [ -z "$line" ] && continue
                     HOST="$line"
-                    output=$(dispatch_command "${original_args[@]}" 2>&1 || true)
+                    output=$(dispatch_command "${original_args[@]}" 2>/dev/null || \
+                             printf '{"status":"error","message":"command failed"}')
                     if [ "$first_host" -eq 1 ]; then
                         first_host=0
                     else
