@@ -7,7 +7,7 @@
 #
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 RTDASH_CTL=""  # path to rtdash-ctl binary (built from librtdash)
 
 RED='\033[0;31m'
@@ -75,7 +75,7 @@ EOF
 
 gen_password() {
     python3 -c "import secrets; print(secrets.token_urlsafe(20)[:16])" 2>/dev/null || \
-    tr -dc "A-Za-z0-9" </dev/urandom | head -c 16
+    { tr -dc "A-Za-z0-9" </dev/urandom | head -c 16; true; }
 }
 
 detect_interface() {
