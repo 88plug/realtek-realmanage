@@ -485,9 +485,15 @@ echo ""
 log "Activation complete!"
 echo ""
 echo "  Next steps:"
-echo "    1. Verify: realmanage -t $OOB_IP -u $USERNAME -P '$PASSWORD' info"
-echo "    2. Web UI: http://$OOB_IP:623"
-echo "    3. Power:  realmanage -t $OOB_IP -u $USERNAME -P '$PASSWORD' power status"
+if [ -n "$OOB_IP" ]; then
+    echo "    1. Verify: realmanage -t $OOB_IP -u $USERNAME -P '$PASSWORD' info"
+    echo "    2. Web UI: http://$OOB_IP:623"
+    echo "    3. Power:  realmanage -t $OOB_IP -u $USERNAME -P '$PASSWORD' power status"
+else
+    warn "OOB IP not detected — use BIOS RealManage Setup Agent (Shift+F10 at POST) or -4 flag"
+    echo "    1. Find OOB IP: sudo rtdash-ctl -i $IFACE get-ipv4"
+    echo "    2. Then:        realmanage -t <oob-ip> -u $USERNAME -P '$PASSWORD' info"
+fi
 echo "    4. Enable rtdashd service: sudo systemctl enable --now rtdashd"
 echo ""
 
