@@ -146,7 +146,7 @@ check_default_creds() {
 }
 
 configure_via_wsman() {
-    local ip="$1" user="$2" pass="$3" old_user="Administrator" old_pass="Realtek"
+    local ip="$1" pass="$2" old_user="Administrator" old_pass="Realtek"
     local cim="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2"
 
     log "Changing default credentials via WS-Man..."
@@ -451,7 +451,7 @@ if [ -n "$OOB_IP" ]; then
     log "Checking if DASH is reachable at $OOB_IP:623..."
     if check_default_creds "$OOB_IP"; then
         log "DASH responding with default credentials — changing now"
-        configure_via_wsman "$OOB_IP" "$USERNAME" "$PASSWORD"
+        configure_via_wsman "$OOB_IP" "$PASSWORD"
     else
         warn "Cannot reach DASH at $OOB_IP:623 with default credentials"
         warn "Credentials may already be changed, or DASH not yet initialized"

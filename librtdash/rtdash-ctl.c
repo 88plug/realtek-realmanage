@@ -43,7 +43,7 @@ static int parse_hex(const char *s, uint8_t *out, size_t max_len)
 	if (slen % 2 != 0 || slen / 2 > max_len)
 		return -1;
 	for (i = 0; i < slen / 2; i++) {
-		char byte[3] = { s[i*2], s[i*2+1], '\0' };
+		const char byte[3] = { s[i*2], s[i*2+1], '\0' };
 		out[i] = (uint8_t)strtoul(byte, NULL, 16);
 	}
 	return (int)(slen / 2);
