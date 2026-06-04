@@ -1,0 +1,36 @@
+# realtek-realmanage
+
+> Native Linux toolkit for Realtek RealManage (DMTF DASH) out-of-band management. Ports the Windows-only Realtek Management Console, DASHConfigRT, and RtDashService to Linux. Works even when the machine is powered off.
+
+## Documentation
+
+- [README](https://github.com/88plug/realtek-realmanage/blob/main/README.md): Overview, quick start, architecture diagram
+- [Wiki: Installation](https://github.com/88plug/realtek-realmanage/wiki/Installation): Build from source, AUR, driver requirements
+- [Wiki: Hardware Compatibility](https://github.com/88plug/realtek-realmanage/wiki/Hardware-Compatibility): Supported chips (RTL8111EP/FP, RTL8125BP, RTL8126, RTL8127AP), vendor matrix
+- [Wiki: BIOS Setup](https://github.com/88plug/realtek-realmanage/wiki/BIOS-Setup): Per-vendor BIOS paths to enable DASH (Gigabyte, HP, Lenovo, Dell, ASUS, MSI, ASRock)
+- [Wiki: dash-activate](https://github.com/88plug/realtek-realmanage/wiki/dash-activate): Provisioning tool — replaces Windows DASHConfigRT
+- [Wiki: realmanage](https://github.com/88plug/realtek-realmanage/wiki/realmanage): Management CLI — all commands, power states, fleet mode, JSON output
+- [Wiki: rtdashd](https://github.com/88plug/realtek-realmanage/wiki/rtdashd): Systemd OS agent daemon, Prometheus metrics, config file
+- [Wiki: rtdash-ctl](https://github.com/88plug/realtek-realmanage/wiki/rtdash-ctl): Low-level ioctl tool — IPv4/IPv6, SNMP, wake patterns, ARP offload
+- [Wiki: librtdash API](https://github.com/88plug/realtek-realmanage/wiki/librtdash-API): C library API reference with code examples
+- [Wiki: DASH Protocol](https://github.com/88plug/realtek-realmanage/wiki/DASH-Protocol): CIM URI table, power state values, IPC2 internals, ports
+- [Wiki: Troubleshooting](https://github.com/88plug/realtek-realmanage/wiki/Troubleshooting): Common errors and fixes
+
+## Source files
+
+- [librtdash/rtdash.h](https://github.com/88plug/realtek-realmanage/blob/main/librtdash/rtdash.h): Public C API — all function signatures and structs
+- [librtdash/rtdash_ioctl.h](https://github.com/88plug/realtek-realmanage/blob/main/librtdash/rtdash_ioctl.h): Kernel ioctl constants (SIOCDEVPRIVATE_RTLDASH, IPC2 registers)
+- [librtdash/rtdash.c](https://github.com/88plug/realtek-realmanage/blob/main/librtdash/rtdash.c): Library implementation
+- [librtdash/rtdash-ctl.c](https://github.com/88plug/realtek-realmanage/blob/main/librtdash/rtdash-ctl.c): CLI ioctl tool
+- [rtdashd/rtdashd.c](https://github.com/88plug/realtek-realmanage/blob/main/rtdashd/rtdashd.c): OS agent daemon with Prometheus metrics and epoll loop
+- [realmanage-cli/realmanage](https://github.com/88plug/realtek-realmanage/blob/main/realmanage-cli/realmanage): Bash management CLI (1150 lines, all DASH profiles)
+- [dash-activate/dash-activate](https://github.com/88plug/realtek-realmanage/blob/main/dash-activate/dash-activate): Bash provisioning script
+
+## Key concepts
+
+- **DMTF DASH**: Open standard for out-of-band management via WS-Man/SOAP on TCP port 623 (HTTP) or 664 (HTTPS)
+- **Realtek DASH types**: Type 2/3 = CMAC interface (RTL8111EP/FP, RTL8126); Type 4 = IPC2 mailbox (RTL8125BP, RTL8127AP)
+- **IPC2 mailbox**: TX buffer at MMIO 0x32000, RX at 0x33000, control registers at 0xC100; accessed via SIOCDEVPRIVATE_RTLDASH (0x89F2) ioctl
+- **ioctl gate**: RTL_ENABLE_PCI_DIAG (SIOCRTLTOOL cmd 14) must be sent before any DASH ioctls
+- **Requires**: out-of-tree r8125/r8126/r8127 driver compiled with ENABLE_DASH_SUPPORT=y (mainline r8169 lacks ioctl)
+- **vs Intel AMT**: Same concept but in Ethernet NIC, not PCH; open DMTF standard not proprietary; no vPro required
