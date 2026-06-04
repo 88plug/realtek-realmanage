@@ -38,9 +38,10 @@ jobs:
 
       - name: Update PKGBUILD
         if: steps.check.outputs.update == 'true'
+        env:
+          NEW_VERSION: ${{ steps.check.outputs.version }}
         run: |
-          VERSION=${{ steps.check.outputs.version }}
-          sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur/amd-dash-cli-bin/PKGBUILD
+          sed -i "s/^pkgver=.*/pkgver=$NEW_VERSION/" aur/amd-dash-cli-bin/PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" aur/amd-dash-cli-bin/PKGBUILD
 
       - name: Create PR
